@@ -1,0 +1,211 @@
+# Review package — final fix wave (no git; diff = pre-fix snapshot vs working tree; recaptured PNGs excluded, listed below)
+
+total 3352
+-rw-r--r--@ 1 dsandor  staff   315K Jul  3 22:47 enroll-found.png
+-rw-r--r--@ 1 dsandor  staff   358K Jul  3 22:47 enroll-ready.png
+-rw-r--r--@ 1 dsandor  staff   346K Jul  3 23:29 groups.png
+-rw-r--r--@ 1 dsandor  staff   338K Jul  3 23:29 home.png
+-rw-r--r--@ 1 dsandor  staff   310K Jul  3 23:29 rules.png
+
+## Full diff (unified, 10 context lines)
+diff -ruN -U10 -x '*.min.js' -x assets /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-finalfix/internal/server/rules_handlers_test.go internal/server/rules_handlers_test.go
+--- /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-finalfix/internal/server/rules_handlers_test.go	2026-07-03 22:29:35.000000000 -0400
++++ internal/server/rules_handlers_test.go	2026-07-03 23:25:00.125543185 -0400
+@@ -475,20 +475,38 @@
+ 	if fr.When.Kind != store.WhenOneTime || fr.When.Start != "22:00" {
+ 		t.Errorf("when = %+v, want onetime starting 22:00", fr.When)
+ 	}
+ 	until, _ := time.Parse(time.RFC3339, fr.When.Until)
+ 	want := time.Date(2026, 7, 4, 7, 0, 0, 0, time.Local)
+ 	if !until.Equal(want) {
+ 		t.Errorf("until = %v, want %v (first morning after restart)", until, want)
+ 	}
+ }
+ 
++func TestPauseGrantDegenerateWindowLeavesPauseIntact(t *testing.T) {
++	ts, _, st, srv := newTestServer(t)
++	c := doSetup(t, ts)
++	seedProfile(t, st)
++	fixedNow(t, srv, "2026-07-04 06:30")
++
++	// Indefinite pause; a 30m grant lands exactly at 07:00, so the morning
++	// re-engage window would start and end in the same clock minute.
++	doJSON(t, c, "POST", ts.URL+"/api/pause", `{"profileId":"p1","duration":"indefinite"}`, nil)
++	if code := doJSON(t, c, "POST", ts.URL+"/api/pause/p1/delay", `{"delay":"30m"}`, nil); code != 400 {
++		t.Fatalf("degenerate grant = %d, want 400", code)
++	}
++	rs := st.Snapshot().Rules
++	if len(rs) != 1 || rs[0].When.Kind != store.WhenAlways {
++		t.Errorf("failed grant must leave the pause untouched: %+v", rs)
++	}
++}
++
+ func TestPauseGrantPendingPushesPromisedStart(t *testing.T) {
+ 	ts, _, st, srv := newTestServer(t)
+ 	c := doSetup(t, ts)
+ 	seedProfile(t, st)
+ 	fixedNow(t, srv, "2026-07-03 20:00")
+ 
+ 	// Scheduled pause: starts 20:30, ends 21:30.
+ 	doJSON(t, c, "POST", ts.URL+"/api/pause", `{"profileId":"p1","duration":"1h","delay":"30m"}`, nil)
+ 	origUntil := st.Snapshot().Rules[0].When.Until
+ 
+diff -ruN -U10 -x '*.min.js' -x assets /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-finalfix/internal/server/rules_handlers.go internal/server/rules_handlers.go
+--- /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-finalfix/internal/server/rules_handlers.go	2026-07-03 22:29:52.000000000 -0400
++++ internal/server/rules_handlers.go	2026-07-03 23:25:13.554635394 -0400
+@@ -405,34 +405,45 @@
+ 		}
+ 		until = t
+ 		if start, ok := rules.OneTimeStart(pr.When); ok && now.Before(start) {
+ 			base = start // pending: "+30 min" counts from the promised start
+ 		}
+ 	default:
+ 		fail(w, 400, "This pause can't be extended.")
+ 		return
+ 	}
+ 	newStart := base.Add(delay)
++	// The grant outlasts the pause — lifting it is the whole grant.
++	collapse := !until.After(newStart.Add(time.Minute))
++	var fr store.FamilyRule
++	if !collapse {
++		fr = store.FamilyRule{
++			ID: store.NewID(), ProfileID: p.ID, Name: "Internet pause",
++			What: store.What{Type: store.WhatEverything}, When: oneTimeUntil(newStart, until),
++			Enabled: true, Pause: true,
++		}
++		// Dry-run the translation before touching the existing pause: a
++		// degenerate re-engage window (start and end landing in the same
++		// clock minute) fails translation, and the pause must survive that.
++		if _, err := rules.Translate(fr, p); err != nil {
++			fail(w, 400, err.Error())
++			return
++		}
++	}
+ 	if err := s.removePauseRules(r.Context(), p.ID); err != nil {
+ 		failErr(w, err)
+ 		return
+ 	}
+-	// The grant outlasts the pause — lifting it is the whole grant.
+-	if !until.After(newStart.Add(time.Minute)) {
++	if collapse {
+ 		writeJSON(w, 200, map[string]bool{"removed": true})
+ 		return
+ 	}
+-	fr := store.FamilyRule{
+-		ID: store.NewID(), ProfileID: p.ID, Name: "Internet pause",
+-		What: store.What{Type: store.WhatEverything}, When: oneTimeUntil(newStart, until),
+-		Enabled: true, Pause: true,
+-	}
+ 	fr, code, err := s.createFamilyRule(r.Context(), fr, p)
+ 	if err != nil {
+ 		if code == 0 {
+ 			failErr(w, err)
+ 		} else {
+ 			fail(w, code, err.Error())
+ 		}
+ 		return
+ 	}
+ 	writeJSON(w, 200, fr)
+diff -ruN -U10 -x '*.min.js' -x assets /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-finalfix/web/static/index.html web/static/index.html
+--- /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-finalfix/web/static/index.html	2026-07-03 22:35:45.000000000 -0400
++++ web/static/index.html	2026-07-03 23:26:01.079173404 -0400
+@@ -192,21 +192,21 @@
+                   <button class="more" @click="grantMore(p.id)">30 more min</button>
+                   <button class="primary" @click="unpause(p.id)">Resume</button>
+                 </div>
+               </div>
+             </template>
+             <template x-if="groupPending(p.id)">
+               <div class="pausebox scheduled">
+                 <p class="sub" x-text="'Pauses at ' + fmtTime(groupPending(p.id).startsAt)
+                   + (groupPending(p.id).until ? ' · until ' + fmtTime(groupPending(p.id).until) : '')"></p>
+                 <div class="pausebox-actions">
+-                  <button class="more" @click="grantMore(p.id)">+30 min</button>
++                  <button class="more" @click="grantMore(p.id)" title="Give them 30 more minutes before the pause starts">+30 min</button>
+                   <button class="primary" @click="unpause(p.id)">Cancel</button>
+                 </div>
+               </div>
+             </template>
+ 
+             <button class="ghost" @click="goRules(p.id)">Manage rules →</button>
+           </div>
+         </template>
+         <p class="center-note sub" x-show="profiles.length===0">
+           Add your first group in <b>Groups &amp; Devices</b> to start pausing internet access.
+diff -ruN -U10 -x '*.min.js' -x assets /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-finalfix/web/static/js/app.js web/static/js/app.js
+--- /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-finalfix/web/static/js/app.js	2026-07-03 22:35:38.000000000 -0400
++++ web/static/js/app.js	2026-07-03 23:28:17.377386248 -0400
+@@ -51,21 +51,21 @@
+       // entirely even on a totally fresh browser.
+       if (location.pathname === '/enroll') { await this.initEnroll(); return; }
+       await this.refreshState();
+       this.route();
+     },
+ 
+     // mockPreview renders a view with sample data, client-side only — the
+     // server still rejects every API call without a real session.
+     mockPreview(view) {
+       this.state = { configured: true, authed: true };
+-      const now = Date.now();
++      const now = Math.floor(Date.now() / 1800e3) * 1800e3; // half-hour boundary: preview times (and marketing screenshots) stay clean
+       const hhmm = d => new Date(d).toTimeString().slice(0, 5);
+ 
+       this.profiles = [
+         { id: 'kids', name: 'Kids', emoji: '🧒', color: '#22d3ee',
+           devices: [{ mac: 'a1:b2:c3:00:00:01', name: "Ava's iPad" }, { mac: 'a1:b2:c3:00:00:02', name: "Noah's Switch" }] },
+         { id: 'teens', name: 'Teens', emoji: '🎧', color: '#3b82f6',
+           devices: [{ mac: 'a1:b2:c3:00:00:03', name: "Mia's Phone" }] },
+       ];
+       this.devices = [
+         { mac: 'a1:b2:c3:00:00:01', name: "Ava's iPad", connected: true, wireless: true, profileId: 'kids' },
+@@ -81,22 +81,22 @@
+         { id: 'r2', profileId: 'kids', name: 'No Roblox during homework',
+           what: { type: 'preset', presetId: 'roblox' },
+           when: { kind: 'recurring', days: ['mon','tue','wed','thu','fri'], start: hhmm(now + 3600e3), end: hhmm(now + 3 * 3600e3) },
+           enabled: true, pause: false, active: false },
+         { id: 'r3', profileId: 'teens', name: 'Teens: social media curfew',
+           what: { type: 'category', categoryId: 'social' },
+           when: { kind: 'recurring', days: ['sun','mon','tue','wed','thu','fri','sat'], start: '22:00', end: '06:00' },
+           enabled: true, pause: false, active: false },
+         { id: 'r4', profileId: 'teens', name: 'Internet pause',
+           what: { type: 'everything' },
+-          when: { kind: 'onetime', start: hhmm(now), until: new Date(now + 20 * 60e3).toISOString() },
+-          enabled: true, pause: true, active: true, until: new Date(now + 20 * 60e3).toISOString() },
++          when: { kind: 'onetime', start: hhmm(now), until: new Date(now + 30 * 60e3).toISOString() },
++          enabled: true, pause: true, active: true, until: new Date(now + 30 * 60e3).toISOString() },
+         // Pending (scheduled) pause — with real data a profile has at most one pause rule.
+         { id: 'r9', profileId: 'kids', name: 'Internet pause',
+           what: { type: 'everything' },
+           when: { kind: 'onetime', start: hhmm(now + 30 * 60e3), until: new Date(now + 90 * 60e3).toISOString() },
+           enabled: true, pause: true, active: false,
+           startsAt: new Date(now + 30 * 60e3).toISOString(),
+           until: new Date(now + 90 * 60e3).toISOString() },
+       ];
+       this.presets = [
+         { id: 'youtube', name: 'YouTube', emoji: '📺', domains: [] },
+diff -ruN -U10 -x '*.min.js' -x assets /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-finalfix/landing/index.html landing/index.html
+--- /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-finalfix/landing/index.html	2026-07-03 23:08:29.000000000 -0400
++++ landing/index.html	2026-07-03 23:25:31.803688323 -0400
+@@ -619,21 +619,21 @@
+     <h2>The parts you'll never have to think about.</h2>
+     <div class="cards2">
+       <div class="card glass">
+         <h3>It keeps working even when the app is closed.</h3>
+         <p class="lede">Family Time writes its rules into the network box you already own, schedule and all. Close the app, reboot the computer it runs on — bedtime still happens.</p>
+         <p class="foot-note">Your UniFi gateway does the enforcing.</p>
+       </div>
+       <div class="card glass">
+         <h3>Built for iPhone privacy features.</h3>
+         <p class="lede">iPhones hide behind a randomized Wi-Fi address, which is why they show up in router lists as "iPhone 72:68." Family Time recognizes the device by its live connection instead, so enrollment just works.</p>
+-        <p class="foot-note">Private Wi-Fi Address on? Still works.</p>
++        <p class="foot-note">Apple's default Private Wi-Fi Address? Still works.</p>
+       </div>
+     </div>
+   </div>
+ </section>
+ 
+ <!-- ============ SEE IT ============ -->
+ <section id="peek">
+   <div class="wrap">
+     <p class="eyebrow">A quick look</p>
+     <h2>Calm control, one screen at a time.</h2>

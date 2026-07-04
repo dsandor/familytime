@@ -1,0 +1,622 @@
+# Task 2 brief — Bedtime implementation plan
+
+## Global Constraints
+
+- **NEVER run any `git` command.** No `git init`, no commits, no pushes — the user's team handles version control. This overrides the usual commit-per-step workflow: where a normal plan says "commit", instead just re-run the verification commands.
+- Project root: `/Users/dsandor/Projects/bedtime`. All commands run from there unless a step says otherwise.
+- Module name: `bedtime`. Go `1.24`.
+- Only external Go dependency allowed: `golang.org/x/crypto` (bcrypt). Everything else stdlib.
+- Every UniFi rule this app creates has a description starting with exactly `[bedtime] `. Never modify or delete a gateway rule whose description lacks that prefix.
+- Store file permissions 0600; writes are temp-file + rename (atomic).
+- Defaults: port `8080`, data file `<os.UserConfigDir()>/bedtime/bedtime.json`.
+- After every task: `go build ./... && go vet ./... && go test ./...` must pass.
+- `ls` is aliased on this machine — use `/bin/ls` in shell commands.
+- The live gateway is at `https://192.168.0.1` with the API key in `.env` (`UNIFI_API_KEY`). **Do not create/modify/delete anything on the gateway except in Task 10 (opt-in E2E), and never touch rules lacking the `[bedtime]`/`[bedtime-e2e]` prefix.** The user's real rule "kids apps" must survive untouched.
+
+
+
+## Verified UniFi v2 API facts (probed live 2026-07-02 — treat as ground truth)
+
+- Base: `https://192.168.0.1/proxy/network/v2/api/site/default/trafficrules`, header `X-API-KEY`, self-signed TLS.
+- Writes return **200 or 201** interchangeably. No GET-by-id — list and filter. DELETE returns 200.
+- `schedule.mode`: `ALWAYS`, `EVERY_DAY`, `EVERY_WEEK` (+ `repeat_on_days: ["sun".."sat"]`), `ONE_TIME_ONLY` (+ single `date: "YYYY-MM-DD"`).
+- Time ranges crossing midnight (`21:00`→`07:00`) are **accepted natively** — no rule splitting.
+- `target_devices`: `{"client_mac": "aa:bb:…", "type": "CLIENT"}` or `{"type": "ALL_CLIENTS"}`.
+- `matching_target`: `DOMAIN` (with `domains: [{domain, ports: [], port_ranges: []}]`), `APP_CATEGORY` (with `app_category_ids` as **integers**), `INTERNET` (full block).
+- Captured real payloads: `internal/unifi/testdata/trafficrules_probe.json` (already in the repo — 4 probe rules covering weekly/midnight/ALL_CLIENTS/one-time shapes).
+- Official v1 API (`/proxy/network/integration/v1/…`) works for `info`, `sites`, `sites/{id}/clients` (paginated envelope `{offset,limit,count,totalCount,data}`) — used read-only for device inventory.
+
+
+
+### Task 2: UniFi API client
+
+**Files:**
+- Create: `internal/unifi/types.go`, `internal/unifi/client.go`
+- Test: `internal/unifi/client_test.go` (uses existing `internal/unifi/testdata/trafficrules_probe.json`)
+
+**Interfaces:**
+- Consumes: nothing from other tasks
+- Produces (`bedtime/internal/unifi`):
+  - Constants: `ActionBlock`, `MatchDomain`, `MatchAppCategory`, `MatchInternet`, `ModeAlways`, `ModeEveryDay`, `ModeEveryWeek`, `ModeOneTime`, `TargetTypeClient`, `TargetTypeAllClients`, `DirectionTo`
+  - Types: `TrafficRule`, `Schedule`, `Domain`, `TargetDevice`, `Site`, `NetClient`
+  - `New(host, apiKey, certFingerprint string) *Client` (host may be bare IP or full URL — tests pass `httptest` URLs and `""` for the fingerprint)
+  - `FetchCertFingerprint(ctx, host string) (string, error)` — SHA-256 hex of the gateway's leaf cert, captured once at setup (trust-on-first-use)
+  - Methods: `Version(ctx) (string, error)`, `FirstSite(ctx) (Site, error)`, `ListClients(ctx, siteID string) ([]NetClient, error)`, `ListTrafficRules(ctx) ([]TrafficRule, error)`, `CreateTrafficRule(ctx, TrafficRule) (TrafficRule, error)`, `UpdateTrafficRule(ctx, TrafficRule) error`, `DeleteTrafficRule(ctx, id string) error`
+  - Errors: `ErrUnauthorized`, `ErrNotFound`, `ErrCertChanged` (match with `errors.Is`)
+
+- [ ] **Step 1: Write types**
+
+Create `internal/unifi/types.go`:
+
+```go
+package unifi
+
+// Enum values verified against a live UCG Max (Network 10.4.57) on
+// 2026-07-02 — see testdata/trafficrules_probe.json for captured payloads.
+const (
+	ActionBlock = "BLOCK"
+
+	MatchDomain      = "DOMAIN"
+	MatchAppCategory = "APP_CATEGORY"
+	MatchInternet    = "INTERNET"
+
+	ModeAlways    = "ALWAYS"
+	ModeEveryDay  = "EVERY_DAY"
+	ModeEveryWeek = "EVERY_WEEK"
+	ModeOneTime   = "ONE_TIME_ONLY"
+
+	TargetTypeClient     = "CLIENT"
+	TargetTypeAllClients = "ALL_CLIENTS"
+
+	DirectionTo = "TO"
+)
+
+type Domain struct {
+	Domain     string   `json:"domain"`
+	Ports      []int    `json:"ports"`
+	PortRanges []any    `json:"port_ranges"`
+}
+
+type TargetDevice struct {
+	ClientMAC string `json:"client_mac,omitempty"`
+	Type      string `json:"type"`
+}
+
+type Schedule struct {
+	Mode           string   `json:"mode"`
+	Date           string   `json:"date,omitempty"` // ONE_TIME_ONLY: "2026-07-03"
+	RepeatOnDays   []string `json:"repeat_on_days"` // EVERY_WEEK: ["sun".."sat"]
+	TimeAllDay     bool     `json:"time_all_day"`
+	TimeRangeStart string   `json:"time_range_start,omitempty"` // "20:00"
+	TimeRangeEnd   string   `json:"time_range_end,omitempty"`   // may be earlier than start (crosses midnight)
+}
+
+// TrafficRule mirrors the v2 trafficrules payload. Slices must be non-nil on
+// create (the API expects [] not null) — NewBlockRule initializes them.
+type TrafficRule struct {
+	ID               string         `json:"_id,omitempty"`
+	Action           string         `json:"action"`
+	Description      string         `json:"description"`
+	MatchingTarget   string         `json:"matching_target"`
+	Domains          []Domain       `json:"domains"`
+	AppCategoryIDs   []int          `json:"app_category_ids"`
+	AppIDs           []int          `json:"app_ids"`
+	IPAddresses      []string       `json:"ip_addresses"`
+	IPRanges         []string       `json:"ip_ranges"`
+	NetworkIDs       []string       `json:"network_ids"`
+	Regions          []string       `json:"regions"`
+	Schedule         Schedule       `json:"schedule"`
+	TargetDevices    []TargetDevice `json:"target_devices"`
+	TrafficDirection string         `json:"traffic_direction"`
+	Enabled          bool           `json:"enabled"`
+}
+
+// NewBlockRule returns a BLOCK rule with every slice initialized so it
+// marshals as [] rather than null.
+func NewBlockRule() TrafficRule {
+	return TrafficRule{
+		Action:           ActionBlock,
+		Domains:          []Domain{},
+		AppCategoryIDs:   []int{},
+		AppIDs:           []int{},
+		IPAddresses:      []string{},
+		IPRanges:         []string{},
+		NetworkIDs:       []string{},
+		Regions:          []string{},
+		Schedule:         Schedule{RepeatOnDays: []string{}},
+		TargetDevices:    []TargetDevice{},
+		TrafficDirection: DirectionTo,
+	}
+}
+
+// Site is an official v1 API site.
+type Site struct {
+	ID                string `json:"id"`
+	InternalReference string `json:"internalReference"`
+	Name              string `json:"name"`
+}
+
+// NetClient is an official v1 API client (a device on the network).
+type NetClient struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	IPAddress   string `json:"ipAddress"`
+	MACAddress  string `json:"macAddress"`
+	Type        string `json:"type"` // WIRED | WIRELESS
+	ConnectedAt string `json:"connectedAt"`
+}
+```
+
+- [ ] **Step 2: Write the failing client test**
+
+Create `internal/unifi/client_test.go`:
+
+```go
+package unifi
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+)
+
+func loadProbeFixture(t *testing.T) []byte {
+	t.Helper()
+	raw, err := os.ReadFile("testdata/trafficrules_probe.json")
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	return raw
+}
+
+func TestListTrafficRulesParsesProbeFixture(t *testing.T) {
+	fixture := loadProbeFixture(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/proxy/network/v2/api/site/default/trafficrules" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		if r.Header.Get("X-API-KEY") != "test-key" {
+			t.Errorf("missing api key header")
+		}
+		w.Write(fixture)
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "test-key", "")
+	rules, err := c.ListTrafficRules(context.Background())
+	if err != nil {
+		t.Fatalf("ListTrafficRules: %v", err)
+	}
+	if len(rules) != 4 {
+		t.Fatalf("got %d rules, want 4 (probe fixture)", len(rules))
+	}
+	byDesc := map[string]TrafficRule{}
+	for _, r := range rules {
+		byDesc[r.Description] = r
+	}
+	weekly := byDesc["[bedtime-probe] weekly"]
+	if weekly.Schedule.Mode != ModeEveryWeek || len(weekly.Schedule.RepeatOnDays) != 2 {
+		t.Errorf("weekly schedule parsed wrong: %+v", weekly.Schedule)
+	}
+	everyone := byDesc["[bedtime-probe] everyone"]
+	if len(everyone.TargetDevices) != 1 || everyone.TargetDevices[0].Type != TargetTypeAllClients {
+		t.Errorf("ALL_CLIENTS target parsed wrong: %+v", everyone.TargetDevices)
+	}
+	onetime := byDesc["[bedtime-probe] onetime2"]
+	if onetime.Schedule.Mode != ModeOneTime || onetime.Schedule.Date == "" {
+		t.Errorf("one-time schedule parsed wrong: %+v", onetime.Schedule)
+	}
+	if onetime.MatchingTarget != MatchInternet {
+		t.Errorf("matching_target = %s, want INTERNET", onetime.MatchingTarget)
+	}
+}
+
+func TestCreateTrafficRuleAccepts200And201(t *testing.T) {
+	for _, code := range []int{200, 201} {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var in TrafficRule
+			json.NewDecoder(r.Body).Decode(&in)
+			in.ID = "new-id"
+			w.WriteHeader(code)
+			json.NewEncoder(w).Encode(in)
+		}))
+		c := New(ts.URL, "k", "")
+		rule := NewBlockRule()
+		rule.Description = "[bedtime] x test"
+		out, err := c.CreateTrafficRule(context.Background(), rule)
+		ts.Close()
+		if err != nil {
+			t.Fatalf("code %d: %v", code, err)
+		}
+		if out.ID != "new-id" {
+			t.Errorf("code %d: ID = %q", code, out.ID)
+		}
+	}
+}
+
+func TestCreateSendsEmptyArraysNotNull(t *testing.T) {
+	var body map[string]json.RawMessage
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&body)
+		w.Write([]byte(`{"_id":"x"}`))
+	}))
+	defer ts.Close()
+	c := New(ts.URL, "k", "")
+	c.CreateTrafficRule(context.Background(), NewBlockRule())
+	for _, field := range []string{"domains", "app_category_ids", "app_ids", "ip_addresses", "network_ids", "target_devices"} {
+		if string(body[field]) == "null" {
+			t.Errorf("field %s marshaled as null, want []", field)
+		}
+	}
+}
+
+func TestUpdateTrafficRulePutsToIDPath(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/proxy/network/v2/api/site/default/trafficrules/abc" {
+			t.Errorf("%s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(201) // the documented PUT-returns-201 quirk
+		w.Write([]byte(`{}`))
+	}))
+	defer ts.Close()
+	c := New(ts.URL, "k", "")
+	r := NewBlockRule()
+	r.ID = "abc"
+	if err := c.UpdateTrafficRule(context.Background(), r); err != nil {
+		t.Fatalf("UpdateTrafficRule: %v", err)
+	}
+}
+
+func TestErrorMapping(t *testing.T) {
+	for code, want := range map[int]error{401: ErrUnauthorized, 403: ErrUnauthorized, 404: ErrNotFound} {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(code)
+		}))
+		c := New(ts.URL, "k", "")
+		_, err := c.ListTrafficRules(context.Background())
+		ts.Close()
+		if !errors.Is(err, want) {
+			t.Errorf("code %d: err = %v, want %v", code, err, want)
+		}
+	}
+}
+
+func TestListClientsPaginates(t *testing.T) {
+	page := func(offset, total int, items []string) string {
+		type cl struct{ Name string `json:"name"` }
+		var data []cl
+		for _, n := range items {
+			data = append(data, cl{n})
+		}
+		raw, _ := json.Marshal(map[string]any{
+			"offset": offset, "limit": 200, "count": len(items), "totalCount": total, "data": data,
+		})
+		return string(raw)
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/proxy/network/integration/v1/sites/s1/clients" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		switch r.URL.Query().Get("offset") {
+		case "", "0":
+			fmt.Fprint(w, page(0, 3, []string{"a", "b"}))
+		case "2":
+			fmt.Fprint(w, page(2, 3, []string{"c"}))
+		default:
+			t.Errorf("unexpected offset %s", r.URL.Query().Get("offset"))
+		}
+	}))
+	defer ts.Close()
+	c := New(ts.URL, "k", "")
+	clients, err := c.ListClients(context.Background(), "s1")
+	if err != nil {
+		t.Fatalf("ListClients: %v", err)
+	}
+	if len(clients) != 3 {
+		t.Errorf("got %d clients, want 3", len(clients))
+	}
+}
+
+func TestPinnedCertVerification(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`[]`))
+	}))
+	defer ts.Close()
+	sum := sha256.Sum256(ts.Certificate().Raw)
+	goodPin := hex.EncodeToString(sum[:])
+
+	c := New(ts.URL, "k", goodPin)
+	if _, err := c.ListTrafficRules(context.Background()); err != nil {
+		t.Fatalf("correct pin should connect: %v", err)
+	}
+
+	bad := New(ts.URL, "k", strings.Repeat("0", 64))
+	if _, err := bad.ListTrafficRules(context.Background()); !errors.Is(err, ErrCertChanged) {
+		t.Errorf("wrong pin: err = %v, want ErrCertChanged", err)
+	}
+
+	fp, err := FetchCertFingerprint(context.Background(), ts.URL)
+	if err != nil || fp != goodPin {
+		t.Errorf("FetchCertFingerprint = %q, %v; want %q", fp, err, goodPin)
+	}
+}
+
+func TestFirstSite(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"offset":0,"limit":25,"count":1,"totalCount":1,"data":[{"id":"s1","internalReference":"default","name":"Default"}]}`)
+	}))
+	defer ts.Close()
+	c := New(ts.URL, "k", "")
+	site, err := c.FirstSite(context.Background())
+	if err != nil {
+		t.Fatalf("FirstSite: %v", err)
+	}
+	if site.ID != "s1" || site.InternalReference != "default" {
+		t.Errorf("site = %+v", site)
+	}
+}
+```
+
+- [ ] **Step 3: Run test to verify it fails**
+
+Run: `go test ./internal/unifi/ -v`
+Expected: FAIL — `New`, `Client` undefined.
+
+- [ ] **Step 4: Implement the client**
+
+Create `internal/unifi/client.go`:
+
+```go
+package unifi
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+var (
+	ErrUnauthorized = errors.New("unifi: unauthorized — check the API key")
+	ErrNotFound     = errors.New("unifi: not found")
+	ErrCertChanged  = errors.New("unifi: gateway TLS certificate changed since setup")
+)
+
+const v2Site = "default" // v2 API uses the site's internalReference
+
+type Client struct {
+	baseURL string
+	apiKey  string
+	hc      *http.Client
+}
+
+// New builds a client for the gateway at host. Host may be a bare IP/name
+// ("192.168.0.1") or a full URL (tests pass httptest URLs).
+//
+// UniFi gateways serve a self-signed certificate, so CA verification cannot
+// succeed. Instead the cert is pinned trust-on-first-use: setup captures its
+// SHA-256 fingerprint via FetchCertFingerprint and every later connection
+// must present the same leaf cert. certFingerprint is "" only during that
+// first fetch and in unit tests.
+func New(host, apiKey, certFingerprint string) *Client {
+	base := host
+	if !strings.Contains(base, "://") {
+		base = "https://" + base
+	}
+	return &Client{
+		baseURL: strings.TrimRight(base, "/"),
+		apiKey:  apiKey,
+		hc: &http.Client{
+			Timeout:   10 * time.Second,
+			Transport: &http.Transport{TLSClientConfig: pinnedTLSConfig(certFingerprint)},
+		},
+	}
+}
+
+// pinnedTLSConfig skips CA-chain verification (self-signed cert) and instead
+// verifies the leaf certificate's SHA-256 fingerprint when one is pinned.
+func pinnedTLSConfig(fingerprint string) *tls.Config {
+	return &tls.Config{
+		InsecureSkipVerify: true, // CA chain can't verify a self-signed cert; the leaf is pinned below
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if fingerprint == "" {
+				return nil // first-use fetch or unit test against httptest
+			}
+			if len(rawCerts) == 0 {
+				return ErrCertChanged
+			}
+			sum := sha256.Sum256(rawCerts[0])
+			if hex.EncodeToString(sum[:]) != fingerprint {
+				return ErrCertChanged
+			}
+			return nil
+		},
+	}
+}
+
+// FetchCertFingerprint connects to host and returns the SHA-256 hex
+// fingerprint of its leaf TLS certificate. Called once at setup
+// (trust-on-first-use) and again from the Settings "trust new certificate"
+// action. Returns "" without error for plain-HTTP hosts (tests).
+func FetchCertFingerprint(ctx context.Context, host string) (string, error) {
+	base := host
+	if !strings.Contains(base, "://") {
+		base = "https://" + base
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme != "https" {
+		return "", nil
+	}
+	addr := u.Host
+	if u.Port() == "" {
+		addr += ":443"
+	}
+	d := tls.Dialer{Config: &tls.Config{InsecureSkipVerify: true}} // fingerprint capture only — result is pinned for all later connections
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return "", fmt.Errorf("unifi: can't reach gateway: %w", err)
+	}
+	defer conn.Close()
+	certs := conn.(*tls.Conn).ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return "", errors.New("unifi: gateway presented no certificate")
+	}
+	sum := sha256.Sum256(certs[0].Raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	var rdr io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("unifi: marshal: %w", err)
+		}
+		rdr = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, rdr)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-API-KEY", c.apiKey)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("unifi: can't reach gateway: %w", err)
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == 401 || resp.StatusCode == 403:
+		return fmt.Errorf("%w (HTTP %d)", ErrUnauthorized, resp.StatusCode)
+	case resp.StatusCode == 404:
+		return fmt.Errorf("%w: %s", ErrNotFound, path)
+	case resp.StatusCode >= 400:
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("unifi: HTTP %d on %s %s: %s", resp.StatusCode, method, path, msg)
+	}
+	if out == nil {
+		return nil
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil // some writes return an empty body
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("unifi: decode %s: %w", path, err)
+	}
+	return nil
+}
+
+// --- official v1 API (read-only) ---
+
+type v1Page[T any] struct {
+	Offset     int `json:"offset"`
+	Count      int `json:"count"`
+	TotalCount int `json:"totalCount"`
+	Data       []T `json:"data"`
+}
+
+func (c *Client) Version(ctx context.Context) (string, error) {
+	var out struct {
+		ApplicationVersion string `json:"applicationVersion"`
+	}
+	err := c.do(ctx, http.MethodGet, "/proxy/network/integration/v1/info", nil, &out)
+	return out.ApplicationVersion, err
+}
+
+func (c *Client) FirstSite(ctx context.Context) (Site, error) {
+	var page v1Page[Site]
+	if err := c.do(ctx, http.MethodGet, "/proxy/network/integration/v1/sites", nil, &page); err != nil {
+		return Site{}, err
+	}
+	if len(page.Data) == 0 {
+		return Site{}, errors.New("unifi: gateway reports no sites")
+	}
+	return page.Data[0], nil
+}
+
+func (c *Client) ListClients(ctx context.Context, siteID string) ([]NetClient, error) {
+	var all []NetClient
+	offset := 0
+	for {
+		var page v1Page[NetClient]
+		path := fmt.Sprintf("/proxy/network/integration/v1/sites/%s/clients?limit=200&offset=%d", siteID, offset)
+		if err := c.do(ctx, http.MethodGet, path, nil, &page); err != nil {
+			return nil, err
+		}
+		all = append(all, page.Data...)
+		offset += page.Count
+		if offset >= page.TotalCount || page.Count == 0 {
+			return all, nil
+		}
+	}
+}
+
+// --- internal v2 API (traffic rules) ---
+
+func (c *Client) trafficRulesPath() string {
+	return "/proxy/network/v2/api/site/" + v2Site + "/trafficrules"
+}
+
+func (c *Client) ListTrafficRules(ctx context.Context) ([]TrafficRule, error) {
+	var out []TrafficRule
+	err := c.do(ctx, http.MethodGet, c.trafficRulesPath(), nil, &out)
+	return out, err
+}
+
+func (c *Client) CreateTrafficRule(ctx context.Context, r TrafficRule) (TrafficRule, error) {
+	var out TrafficRule
+	err := c.do(ctx, http.MethodPost, c.trafficRulesPath(), r, &out)
+	return out, err
+}
+
+func (c *Client) UpdateTrafficRule(ctx context.Context, r TrafficRule) error {
+	if r.ID == "" {
+		return errors.New("unifi: update requires rule _id")
+	}
+	return c.do(ctx, http.MethodPut, c.trafficRulesPath()+"/"+r.ID, r, nil)
+}
+
+func (c *Client) DeleteTrafficRule(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodDelete, c.trafficRulesPath()+"/"+id, nil, nil)
+}
+```
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `go test ./internal/unifi/ -v`
+Expected: PASS (8 tests).
+
+- [ ] **Step 6: Full verification**
+
+Run: `go build ./... && go vet ./... && go test ./...`
+Expected: all pass.
+
+---
+

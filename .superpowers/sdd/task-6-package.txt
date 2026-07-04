@@ -1,0 +1,1002 @@
+# Task 6 review package — new files in full + current handlers.go (registerAPIRoutes was replaced in it)
+
+=================== FILE: internal/server/rules_handlers.go ===================
+package server
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"bedtime/internal/rules"
+	"bedtime/internal/store"
+	"bedtime/internal/unifi"
+)
+
+type ruleInput struct {
+	ProfileID string      `json:"profileId"`
+	Name      string      `json:"name"`
+	What      store.What  `json:"what"`
+	When      store.When  `json:"when"`
+	Enabled   *bool       `json:"enabled"`
+}
+
+// createFamilyRule translates and applies a family rule gateway-first, so
+// the store never references a rule the gateway doesn't have. Returns the
+// stored rule and an HTTP status (0 means: call failErr with err).
+func (s *Server) createFamilyRule(ctx context.Context, fr store.FamilyRule, p store.Profile) (store.FamilyRule, int, error) {
+	tr, err := rules.Translate(fr, p)
+	if err != nil {
+		return fr, http.StatusBadRequest, err
+	}
+	created, err := s.api().CreateTrafficRule(ctx, tr)
+	if err != nil {
+		return fr, 0, err
+	}
+	fr.UnifiRuleIDs = []string{created.ID}
+	err = s.store.Update(func(d *store.Data) error {
+		d.Rules = append(d.Rules, fr)
+		return nil
+	})
+	if err != nil {
+		// Compensate: don't leave an untracked rule enforcing on the gateway.
+		s.deleteGatewayRules(ctx, fr.UnifiRuleIDs)
+		return fr, http.StatusInternalServerError, err
+	}
+	return fr, http.StatusOK, nil
+}
+
+func (s *Server) handleRuleCreate(w http.ResponseWriter, r *http.Request) {
+	var in ruleInput
+	if err := readJSON(r, &in); err != nil {
+		fail(w, 400, "Bad request.")
+		return
+	}
+	in.Name = strings.TrimSpace(in.Name)
+	if in.Name == "" {
+		fail(w, 400, "Give this rule a name.")
+		return
+	}
+	d := s.store.Snapshot()
+	p, ok := profileForID(d, in.ProfileID)
+	if !ok {
+		fail(w, 404, "No such profile.")
+		return
+	}
+	fr := store.FamilyRule{
+		ID: store.NewID(), ProfileID: p.ID, Name: in.Name,
+		What: in.What, When: in.When,
+		Enabled: in.Enabled == nil || *in.Enabled,
+	}
+	fr, code, err := s.createFamilyRule(r.Context(), fr, p)
+	if err != nil {
+		if code == 0 {
+			failErr(w, err)
+		} else {
+			fail(w, code, err.Error())
+		}
+		return
+	}
+	writeJSON(w, 200, fr)
+}
+
+func (s *Server) handleRuleUpdate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var in ruleInput
+	if err := readJSON(r, &in); err != nil {
+		fail(w, 400, "Bad request.")
+		return
+	}
+	d := s.store.Snapshot()
+	var existing *store.FamilyRule
+	for i := range d.Rules {
+		if d.Rules[i].ID == id {
+			existing = &d.Rules[i]
+			break
+		}
+	}
+	if existing == nil {
+		fail(w, 404, "No such rule.")
+		return
+	}
+	p, ok := profileForID(d, existing.ProfileID)
+	if !ok {
+		fail(w, 500, "Rule's profile is missing.")
+		return
+	}
+	updated := *existing
+	updated.Name = strings.TrimSpace(in.Name)
+	updated.What, updated.When = in.What, in.When
+	if in.Enabled != nil {
+		updated.Enabled = *in.Enabled
+	}
+	if updated.Name == "" {
+		fail(w, 400, "Give this rule a name.")
+		return
+	}
+	tr, err := rules.Translate(updated, p)
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	// Rewrite the existing gateway rule; if it vanished (deleted in the
+	// UniFi app), recreate it.
+	if len(updated.UnifiRuleIDs) == 1 {
+		tr.ID = updated.UnifiRuleIDs[0]
+		err = s.api().UpdateTrafficRule(r.Context(), tr)
+	} else {
+		err = unifi.ErrNotFound
+	}
+	if errors.Is(err, unifi.ErrNotFound) {
+		tr.ID = ""
+		created, cerr := s.api().CreateTrafficRule(r.Context(), tr)
+		if cerr != nil {
+			failErr(w, cerr)
+			return
+		}
+		updated.UnifiRuleIDs = []string{created.ID}
+		err = nil
+	}
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	serr := s.store.Update(func(d *store.Data) error {
+		for i := range d.Rules {
+			if d.Rules[i].ID == id {
+				d.Rules[i] = updated
+			}
+		}
+		return nil
+	})
+	if serr != nil {
+		fail(w, 500, serr.Error())
+		return
+	}
+	writeJSON(w, 200, updated)
+}
+
+func (s *Server) handleRuleDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	d := s.store.Snapshot()
+	var target *store.FamilyRule
+	for i := range d.Rules {
+		if d.Rules[i].ID == id {
+			target = &d.Rules[i]
+			break
+		}
+	}
+	if target == nil {
+		fail(w, 404, "No such rule.")
+		return
+	}
+	if err := s.deleteGatewayRules(r.Context(), target.UnifiRuleIDs); err != nil {
+		failErr(w, err)
+		return
+	}
+	serr := s.store.Update(func(d *store.Data) error {
+		for i := range d.Rules {
+			if d.Rules[i].ID == id {
+				d.Rules = append(d.Rules[:i], d.Rules[i+1:]...)
+				break
+			}
+		}
+		return nil
+	})
+	if serr != nil {
+		fail(w, 500, serr.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+type ruleView struct {
+	store.FamilyRule
+	Active bool   `json:"active"`
+	Until  string `json:"until,omitempty"`
+}
+
+func (s *Server) handleRulesList(w http.ResponseWriter, r *http.Request) {
+	d := s.store.Snapshot()
+	now := s.now()
+	out := []ruleView{}
+	for _, fr := range d.Rules {
+		v := ruleView{FamilyRule: fr}
+		if fr.Enabled {
+			active, until, hasUntil := rules.ActiveNow(fr.When, now)
+			v.Active = active
+			if hasUntil {
+				v.Until = until.Format(time.RFC3339)
+			}
+		}
+		out = append(out, v)
+	}
+	writeJSON(w, 200, out)
+}
+
+// removePauseRules deletes all pause rules for a profile, gateway-first.
+func (s *Server) removePauseRules(ctx context.Context, profileID string) error {
+	d := s.store.Snapshot()
+	var ids []string
+	for _, fr := range d.Rules {
+		if fr.ProfileID == profileID && fr.Pause {
+			ids = append(ids, fr.UnifiRuleIDs...)
+		}
+	}
+	if err := s.deleteGatewayRules(ctx, ids); err != nil {
+		return err
+	}
+	return s.store.Update(func(d *store.Data) error {
+		kept := d.Rules[:0]
+		for _, fr := range d.Rules {
+			if !(fr.ProfileID == profileID && fr.Pause) {
+				kept = append(kept, fr)
+			}
+		}
+		d.Rules = kept
+		return nil
+	})
+}
+
+func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ProfileID string `json:"profileId"`
+		Duration  string `json:"duration"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		fail(w, 400, "Bad request.")
+		return
+	}
+	d := s.store.Snapshot()
+	p, ok := profileForID(d, in.ProfileID)
+	if !ok {
+		fail(w, 404, "No such profile.")
+		return
+	}
+	now := s.now()
+	var when store.When
+	switch in.Duration {
+	case "30m":
+		when = oneTimeUntil(now, now.Add(30*time.Minute))
+	case "1h":
+		when = oneTimeUntil(now, now.Add(time.Hour))
+	case "morning":
+		morning := time.Date(now.Year(), now.Month(), now.Day(), 7, 0, 0, 0, now.Location())
+		if !now.Before(morning) {
+			morning = morning.AddDate(0, 0, 1)
+		}
+		when = oneTimeUntil(now, morning)
+	case "indefinite":
+		when = store.When{Kind: store.WhenAlways}
+	default:
+		fail(w, 400, "Unknown pause duration.")
+		return
+	}
+	// Replace any existing pause — tapping Pause twice must not stack rules.
+	if err := s.removePauseRules(r.Context(), p.ID); err != nil {
+		failErr(w, err)
+		return
+	}
+	fr := store.FamilyRule{
+		ID: store.NewID(), ProfileID: p.ID, Name: "Internet pause",
+		What: store.What{Type: store.WhatEverything}, When: when,
+		Enabled: true, Pause: true,
+	}
+	fr, code, err := s.createFamilyRule(r.Context(), fr, p)
+	if err != nil {
+		if code == 0 {
+			failErr(w, err)
+		} else {
+			fail(w, code, err.Error())
+		}
+		return
+	}
+	writeJSON(w, 200, fr)
+}
+
+func oneTimeUntil(now, until time.Time) store.When {
+	return store.When{
+		Kind:  store.WhenOneTime,
+		Start: now.Format("15:04"),
+		Until: until.Format(time.RFC3339),
+	}
+}
+
+func (s *Server) handleUnpause(w http.ResponseWriter, r *http.Request) {
+	if err := s.removePauseRules(r.Context(), r.PathValue("profileId")); err != nil {
+		failErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+type statusLine struct {
+	RuleID string `json:"ruleId"`
+	Name   string `json:"name"`
+	Label  string `json:"label"`
+	Active bool   `json:"active"`
+	Until  string `json:"until,omitempty"`
+	Pause  bool   `json:"pause"`
+}
+
+type profileStatus struct {
+	ID          string       `json:"id"`
+	Name        string       `json:"name"`
+	Emoji       string       `json:"emoji"`
+	Color       string       `json:"color"`
+	DeviceCount int          `json:"deviceCount"`
+	Paused      bool         `json:"paused"`
+	PausedUntil string       `json:"pausedUntil,omitempty"`
+	Lines       []statusLine `json:"lines"`
+}
+
+func whatLabel(wt store.What) string {
+	switch wt.Type {
+	case store.WhatPreset:
+		if p, ok := rules.PresetByID(wt.PresetID); ok {
+			return p.Name
+		}
+		return wt.PresetID
+	case store.WhatCategory:
+		if c, ok := rules.CategoryByID(wt.CategoryID); ok {
+			return c.Name
+		}
+		return wt.CategoryID
+	case store.WhatDomains:
+		return strings.Join(wt.Domains, ", ")
+	case store.WhatEverything:
+		return "All internet"
+	}
+	return wt.Type
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	d := s.store.Snapshot()
+	now := s.now()
+	everyone, _ := profileForID(d, store.EveryoneProfileID)
+	profiles := append([]store.Profile{everyone}, d.Profiles...)
+	sort.SliceStable(profiles[1:], func(i, j int) bool { return profiles[i+1].Name < profiles[j+1].Name })
+
+	out := []profileStatus{}
+	for _, p := range profiles {
+		ps := profileStatus{ID: p.ID, Name: p.Name, Emoji: p.Emoji, Color: p.Color, DeviceCount: len(p.Devices), Lines: []statusLine{}}
+		for _, fr := range d.Rules {
+			if fr.ProfileID != p.ID || !fr.Enabled {
+				continue
+			}
+			active, until, hasUntil := rules.ActiveNow(fr.When, now)
+			line := statusLine{RuleID: fr.ID, Name: fr.Name, Label: whatLabel(fr.What), Active: active, Pause: fr.Pause}
+			if hasUntil {
+				line.Until = until.Format(time.RFC3339)
+			}
+			ps.Lines = append(ps.Lines, line)
+			if fr.Pause && active {
+				ps.Paused = true
+				ps.PausedUntil = line.Until
+			}
+		}
+		out = append(out, ps)
+	}
+	writeJSON(w, 200, out)
+}
+
+=================== FILE: internal/server/settings_handlers.go ===================
+package server
+
+import (
+	"net/http"
+
+	"bedtime/internal/store"
+	"bedtime/internal/unifi"
+)
+
+func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
+	g := s.store.Snapshot().Gateway
+	writeJSON(w, 200, map[string]string{
+		"host":     g.Host,
+		"siteName": g.SiteName,
+		"dataPath": s.store.Path(),
+	})
+}
+
+func (s *Server) handleSettingsPIN(w http.ResponseWriter, r *http.Request) {
+	var in struct{ CurrentPin, NewPin string }
+	if err := readJSON(r, &in); err != nil {
+		fail(w, 400, "Bad request.")
+		return
+	}
+	if !checkPIN(s.store.Snapshot().Auth.PINHash, in.CurrentPin) {
+		fail(w, 401, "Current PIN is wrong.")
+		return
+	}
+	h, err := hashPIN(in.NewPin)
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	if err := s.store.Update(func(d *store.Data) error { d.Auth.PINHash = h; return nil }); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	s.guard.reset()
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// validateAndStoreGateway checks connectivity with the given credentials and
+// persists them. Shared by gateway update and trust-cert.
+func (s *Server) validateAndStoreGateway(w http.ResponseWriter, r *http.Request, host, apiKey string) {
+	fp, err := unifi.FetchCertFingerprint(r.Context(), host)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	api := s.newAPI(host, apiKey, fp)
+	if _, err := api.Version(r.Context()); err != nil {
+		failErr(w, err)
+		return
+	}
+	site, err := api.FirstSite(r.Context())
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	err = s.store.Update(func(d *store.Data) error {
+		d.Gateway = store.Gateway{Host: host, APIKey: apiKey, SiteID: site.ID, SiteName: site.InternalReference, CertFingerprint: fp}
+		return nil
+	})
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleSettingsGateway(w http.ResponseWriter, r *http.Request) {
+	var in struct{ Host, APIKey string }
+	if err := readJSON(r, &in); err != nil || in.Host == "" || in.APIKey == "" {
+		fail(w, 400, "Gateway address and API key are required.")
+		return
+	}
+	s.validateAndStoreGateway(w, r, in.Host, in.APIKey)
+}
+
+// handleTrustCert re-pins the gateway certificate after a legitimate change
+// (e.g. a firmware update regenerated it).
+func (s *Server) handleTrustCert(w http.ResponseWriter, r *http.Request) {
+	g := s.store.Snapshot().Gateway
+	s.validateAndStoreGateway(w, r, g.Host, g.APIKey)
+}
+
+=================== FILE: internal/server/rules_handlers_test.go ===================
+package server
+
+import (
+	"net/http"
+	"testing"
+	"time"
+
+	"bedtime/internal/store"
+	"bedtime/internal/unifi"
+)
+
+// seedProfile stores a profile with one device and returns its id.
+func seedProfile(t *testing.T, st *store.Store) string {
+	t.Helper()
+	err := st.Update(func(d *store.Data) error {
+		d.Profiles = append(d.Profiles, store.Profile{
+			ID: "p1", Name: "Emma", Emoji: "🦄",
+			Devices: []store.Device{{MAC: "aa:aa:aa:aa:aa:01", Name: "iPad"}},
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "p1"
+}
+
+func fixedNow(t *testing.T, srv *Server, stamp string) time.Time {
+	t.Helper()
+	now, err := time.ParseInLocation("2006-01-02 15:04", stamp, time.Local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.now = func() time.Time { return now }
+	return now
+}
+
+func TestRuleLifecycle(t *testing.T) {
+	ts, fake, st, _ := newTestServer(t)
+	c := doSetup(t, ts)
+	seedProfile(t, st)
+
+	var created store.FamilyRule
+	code := doJSON(t, c, "POST", ts.URL+"/api/rules",
+		`{"profileId":"p1","name":"No YouTube","what":{"type":"preset","presetId":"youtube"},
+		  "when":{"kind":"recurring","days":["sun","mon","tue","wed","thu"],"start":"20:00","end":"07:00"}}`, &created)
+	if code != 200 || created.ID == "" || len(created.UnifiRuleIDs) != 1 {
+		t.Fatalf("create = %d, %+v", code, created)
+	}
+	gw, ok := fake.ruleByDesc(created.ID)
+	if !ok {
+		t.Fatal("gateway rule not created")
+	}
+	if gw.Schedule.Mode != unifi.ModeEveryWeek || gw.MatchingTarget != unifi.MatchDomain || !gw.Enabled {
+		t.Errorf("gateway rule wrong: %+v", gw)
+	}
+
+	// Update: rename + disable.
+	code = doJSON(t, c, "PUT", ts.URL+"/api/rules/"+created.ID,
+		`{"name":"YouTube off","what":{"type":"preset","presetId":"youtube"},
+		  "when":{"kind":"always"},"enabled":false}`, nil)
+	if code != 200 {
+		t.Fatalf("update = %d", code)
+	}
+	gw, _ = fake.ruleByDesc(created.ID)
+	if gw.Enabled || gw.Schedule.Mode != unifi.ModeAlways {
+		t.Errorf("gateway rule not updated: %+v", gw)
+	}
+	if st.Snapshot().Rules[0].Name != "YouTube off" || st.Snapshot().Rules[0].Enabled {
+		t.Errorf("store not updated: %+v", st.Snapshot().Rules)
+	}
+
+	// Delete.
+	if code := doJSON(t, c, "DELETE", ts.URL+"/api/rules/"+created.ID, "", nil); code != 200 {
+		t.Fatalf("delete = %d", code)
+	}
+	if len(st.Snapshot().Rules) != 0 || len(fake.rules) != 0 {
+		t.Error("rule not fully deleted")
+	}
+}
+
+func TestRuleCreateValidation(t *testing.T) {
+	ts, _, st, _ := newTestServer(t)
+	c := doSetup(t, ts)
+	if code := doJSON(t, c, "POST", ts.URL+"/api/rules",
+		`{"profileId":"nope","name":"x","what":{"type":"everything"},"when":{"kind":"always"}}`, nil); code != 404 {
+		t.Errorf("unknown profile = %d, want 404", code)
+	}
+	// Profile with no devices → Translate error → 400.
+	st.Update(func(d *store.Data) error {
+		d.Profiles = append(d.Profiles, store.Profile{ID: "p2", Name: "Empty"})
+		return nil
+	})
+	if code := doJSON(t, c, "POST", ts.URL+"/api/rules",
+		`{"profileId":"p2","name":"x","what":{"type":"everything"},"when":{"kind":"always"}}`, nil); code != 400 {
+		t.Errorf("empty profile = %d, want 400", code)
+	}
+	if code := doJSON(t, c, "POST", ts.URL+"/api/rules",
+		`{"profileId":"everyone","name":"","what":{"type":"everything"},"when":{"kind":"always"}}`, nil); code != 400 {
+		t.Errorf("empty name = %d, want 400", code)
+	}
+}
+
+func TestRuleCreateGatewayDownPersistsNothing(t *testing.T) {
+	ts, fake, st, _ := newTestServer(t)
+	c := doSetup(t, ts)
+	seedProfile(t, st)
+	fake.failAll = http.ErrHandlerTimeout
+	code := doJSON(t, c, "POST", ts.URL+"/api/rules",
+		`{"profileId":"p1","name":"x","what":{"type":"everything"},"when":{"kind":"always"}}`, nil)
+	if code != 502 {
+		t.Errorf("gateway down = %d, want 502", code)
+	}
+	if len(st.Snapshot().Rules) != 0 {
+		t.Error("nothing may persist when the gateway write failed")
+	}
+}
+
+func TestRuleUpdateRecreatesVanishedGatewayRule(t *testing.T) {
+	ts, fake, st, _ := newTestServer(t)
+	c := doSetup(t, ts)
+	seedProfile(t, st)
+	var created store.FamilyRule
+	doJSON(t, c, "POST", ts.URL+"/api/rules",
+		`{"profileId":"p1","name":"x","what":{"type":"everything"},"when":{"kind":"always"}}`, &created)
+
+	fake.mu.Lock()
+	fake.rules = nil // someone deleted it in the UniFi app
+	fake.mu.Unlock()
+
+	code := doJSON(t, c, "PUT", ts.URL+"/api/rules/"+created.ID,
+		`{"name":"x","what":{"type":"everything"},"when":{"kind":"always"},"enabled":true}`, nil)
+	if code != 200 {
+		t.Fatalf("update = %d", code)
+	}
+	if len(fake.rules) != 1 {
+		t.Fatal("gateway rule not recreated")
+	}
+	if got := st.Snapshot().Rules[0].UnifiRuleIDs[0]; got != fake.rules[0].ID {
+		t.Errorf("store id %q != gateway id %q", got, fake.rules[0].ID)
+	}
+}
+
+func TestPauseReplaceAndUnpause(t *testing.T) {
+	ts, fake, st, srv := newTestServer(t)
+	c := doSetup(t, ts)
+	seedProfile(t, st)
+	now := fixedNow(t, srv, "2026-07-03 21:30") // Friday evening
+
+	if code := doJSON(t, c, "POST", ts.URL+"/api/pause", `{"profileId":"p1","duration":"30m"}`, nil); code != 200 {
+		t.Fatalf("pause = %d", code)
+	}
+	rules := st.Snapshot().Rules
+	if len(rules) != 1 || !rules[0].Pause || rules[0].What.Type != store.WhatEverything {
+		t.Fatalf("pause rule wrong: %+v", rules)
+	}
+	until, _ := time.Parse(time.RFC3339, rules[0].When.Until)
+	if !until.Equal(now.Add(30 * time.Minute)) {
+		t.Errorf("until = %v, want %v", until, now.Add(30*time.Minute))
+	}
+
+	// Pausing again replaces (no stacking).
+	doJSON(t, c, "POST", ts.URL+"/api/pause", `{"profileId":"p1","duration":"morning"}`, nil)
+	rules = st.Snapshot().Rules
+	if len(rules) != 1 {
+		t.Fatalf("pause must replace, got %d rules", len(rules))
+	}
+	until, _ = time.Parse(time.RFC3339, rules[0].When.Until)
+	want := time.Date(2026, 7, 4, 7, 0, 0, 0, time.Local) // next morning 07:00
+	if !until.Equal(want) {
+		t.Errorf("morning until = %v, want %v", until, want)
+	}
+	if len(fake.rules) != 1 {
+		t.Errorf("gateway must hold exactly 1 pause rule, got %d", len(fake.rules))
+	}
+
+	// Indefinite pause has no Until.
+	doJSON(t, c, "POST", ts.URL+"/api/pause", `{"profileId":"p1","duration":"indefinite"}`, nil)
+	if got := st.Snapshot().Rules[0].When; got.Kind != store.WhenAlways {
+		t.Errorf("indefinite = %+v", got)
+	}
+
+	if code := doJSON(t, c, "DELETE", ts.URL+"/api/pause/p1", "", nil); code != 200 {
+		t.Fatalf("unpause = %d", code)
+	}
+	if len(st.Snapshot().Rules) != 0 || len(fake.rules) != 0 {
+		t.Error("unpause must remove the pause rule everywhere")
+	}
+	// Unpause with no pause active is fine (idempotent).
+	if code := doJSON(t, c, "DELETE", ts.URL+"/api/pause/p1", "", nil); code != 200 {
+		t.Errorf("second unpause = %d, want 200", code)
+	}
+}
+
+func TestStatusReportsActiveWindows(t *testing.T) {
+	ts, _, st, srv := newTestServer(t)
+	c := doSetup(t, ts)
+	seedProfile(t, st)
+	fixedNow(t, srv, "2026-07-03 21:30") // Friday 21:30
+
+	doJSON(t, c, "POST", ts.URL+"/api/rules",
+		`{"profileId":"p1","name":"School nights","what":{"type":"preset","presetId":"youtube"},
+		  "when":{"kind":"recurring","days":["fri"],"start":"21:00","end":"07:00"}}`, nil)
+	doJSON(t, c, "POST", ts.URL+"/api/rules",
+		`{"profileId":"p1","name":"Weekend mornings","what":{"type":"preset","presetId":"roblox"},
+		  "when":{"kind":"recurring","days":["sat"],"start":"08:00","end":"12:00"}}`, nil)
+	doJSON(t, c, "POST", ts.URL+"/api/pause", `{"profileId":"p1","duration":"30m"}`, nil)
+
+	var out []struct {
+		ID          string `json:"id"`
+		Paused      bool   `json:"paused"`
+		PausedUntil string `json:"pausedUntil"`
+		Lines       []struct {
+			Label  string `json:"label"`
+			Active bool   `json:"active"`
+			Until  string `json:"until"`
+			Pause  bool   `json:"pause"`
+		} `json:"lines"`
+	}
+	if code := getJSON(t, c, ts.URL+"/api/status", &out); code != 200 {
+		t.Fatalf("status = %d", code)
+	}
+	if len(out) != 2 || out[0].ID != store.EveryoneProfileID {
+		t.Fatalf("want [everyone, emma], got %+v", out)
+	}
+	emma := out[1]
+	if !emma.Paused || emma.PausedUntil == "" {
+		t.Errorf("emma should be paused: %+v", emma)
+	}
+	var activeCount int
+	for _, l := range emma.Lines {
+		if l.Active {
+			activeCount++
+		}
+	}
+	// Active: YouTube (Fri 21:00–07:00 window) + the pause. Roblox (Sat morning) inactive.
+	if activeCount != 2 {
+		t.Errorf("want 2 active lines, got %d: %+v", activeCount, emma.Lines)
+	}
+}
+
+func TestSettingsPINChange(t *testing.T) {
+	ts, _, _, _ := newTestServer(t)
+	c := doSetup(t, ts)
+	if code := doJSON(t, c, "PUT", ts.URL+"/api/settings/pin", `{"currentPin":"9999","newPin":"5678"}`, nil); code != 401 {
+		t.Errorf("wrong current pin = %d, want 401", code)
+	}
+	if code := doJSON(t, c, "PUT", ts.URL+"/api/settings/pin", `{"currentPin":"1234","newPin":"5678"}`, nil); code != 200 {
+		t.Errorf("pin change = %d, want 200", code)
+	}
+	fresh := client(t)
+	if code := doJSON(t, fresh, "POST", ts.URL+"/api/login", `{"pin":"5678"}`, nil); code != 200 {
+		t.Errorf("login with new pin = %d, want 200", code)
+	}
+}
+
+=================== FILE: internal/server/handlers.go ===================
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
+
+	"bedtime/internal/rules"
+	"bedtime/internal/store"
+	"bedtime/internal/unifi"
+)
+
+// registerAPIRoutes wires the protected JSON API (auth-gated).
+func (s *Server) registerAPIRoutes() {
+	s.mux.Handle("GET /api/presets", s.auth(s.handlePresets))
+	s.mux.Handle("GET /api/devices", s.auth(s.handleDevices))
+	s.mux.Handle("GET /api/profiles", s.auth(s.handleProfilesList))
+	s.mux.Handle("POST /api/profiles", s.auth(s.handleProfileCreate))
+	s.mux.Handle("PUT /api/profiles/{id}", s.auth(s.handleProfileUpdate))
+	s.mux.Handle("DELETE /api/profiles/{id}", s.auth(s.handleProfileDelete))
+	s.mux.Handle("GET /api/rules", s.auth(s.handleRulesList))
+	s.mux.Handle("POST /api/rules", s.auth(s.handleRuleCreate))
+	s.mux.Handle("PUT /api/rules/{id}", s.auth(s.handleRuleUpdate))
+	s.mux.Handle("DELETE /api/rules/{id}", s.auth(s.handleRuleDelete))
+	s.mux.Handle("POST /api/pause", s.auth(s.handlePause))
+	s.mux.Handle("DELETE /api/pause/{profileId}", s.auth(s.handleUnpause))
+	s.mux.Handle("GET /api/status", s.auth(s.handleStatus))
+	s.mux.Handle("GET /api/settings", s.auth(s.handleSettingsGet))
+	s.mux.Handle("PUT /api/settings/pin", s.auth(s.handleSettingsPIN))
+	s.mux.Handle("PUT /api/settings/gateway", s.auth(s.handleSettingsGateway))
+	s.mux.Handle("POST /api/settings/trust-cert", s.auth(s.handleTrustCert))
+}
+
+func (s *Server) handlePresets(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{
+		"presets":    rules.Presets(),
+		"categories": rules.Categories(),
+	})
+}
+
+// profileForID resolves a profile id, including the virtual Everyone
+// profile (which is never stored).
+func profileForID(d store.Data, id string) (store.Profile, bool) {
+	if id == store.EveryoneProfileID {
+		return store.Profile{ID: store.EveryoneProfileID, Name: "Everyone", Emoji: "🌍"}, true
+	}
+	for _, p := range d.Profiles {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return store.Profile{}, false
+}
+
+type deviceInfo struct {
+	MAC       string `json:"mac"`
+	Name      string `json:"name"`
+	IP        string `json:"ip,omitempty"`
+	Connected bool   `json:"connected"`
+	Wireless  bool   `json:"wireless"`
+	ProfileID string `json:"profileId,omitempty"`
+}
+
+func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
+	d := s.store.Snapshot()
+	live, err := s.api().ListClients(r.Context(), d.Gateway.SiteID)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	assigned := map[string]string{}  // mac → profile id
+	assignedName := map[string]string{} // mac → snapshot name
+	for _, p := range d.Profiles {
+		for _, dev := range p.Devices {
+			assigned[dev.MAC] = p.ID
+			assignedName[dev.MAC] = dev.Name
+		}
+	}
+	seen := map[string]bool{}
+	var out []deviceInfo
+	for _, c := range live {
+		mac := strings.ToLower(c.MACAddress)
+		seen[mac] = true
+		name := c.Name
+		if name == "" {
+			name = mac
+		}
+		out = append(out, deviceInfo{
+			MAC: mac, Name: name, IP: c.IPAddress,
+			Connected: true, Wireless: c.Type == "WIRELESS",
+			ProfileID: assigned[mac],
+		})
+	}
+	for mac, pid := range assigned {
+		if !seen[mac] {
+			out = append(out, deviceInfo{MAC: mac, Name: assignedName[mac], Connected: false, ProfileID: pid})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) handleProfilesList(w http.ResponseWriter, r *http.Request) {
+	d := s.store.Snapshot()
+	if d.Profiles == nil {
+		d.Profiles = []store.Profile{}
+	}
+	writeJSON(w, 200, d.Profiles)
+}
+
+type profileInput struct {
+	Name    string         `json:"name"`
+	Emoji   string         `json:"emoji"`
+	Color   string         `json:"color"`
+	Devices []store.Device `json:"devices"`
+}
+
+// validateProfileInput normalizes MACs and rejects devices already assigned
+// to a different profile (selfID exempts the profile being edited).
+func validateProfileInput(d store.Data, in *profileInput, selfID string) error {
+	in.Name = strings.TrimSpace(in.Name)
+	if in.Name == "" {
+		return fmt.Errorf("give this profile a name")
+	}
+	seen := map[string]bool{}
+	for i := range in.Devices {
+		in.Devices[i].MAC = strings.ToLower(strings.TrimSpace(in.Devices[i].MAC))
+		mac := in.Devices[i].MAC
+		if mac == "" {
+			return fmt.Errorf("device with empty MAC")
+		}
+		if seen[mac] {
+			return fmt.Errorf("device %s listed twice", mac)
+		}
+		seen[mac] = true
+		for _, p := range d.Profiles {
+			if p.ID == selfID {
+				continue
+			}
+			for _, dev := range p.Devices {
+				if dev.MAC == mac {
+					return fmt.Errorf("that device already belongs to %s", p.Name)
+				}
+			}
+		}
+	}
+	if in.Devices == nil {
+		in.Devices = []store.Device{}
+	}
+	return nil
+}
+
+func (s *Server) handleProfileCreate(w http.ResponseWriter, r *http.Request) {
+	var in profileInput
+	if err := readJSON(r, &in); err != nil {
+		fail(w, 400, "Bad request.")
+		return
+	}
+	p := store.Profile{ID: store.NewID()}
+	err := s.store.Update(func(d *store.Data) error {
+		if err := validateProfileInput(*d, &in, p.ID); err != nil {
+			return err
+		}
+		p.Name, p.Emoji, p.Color, p.Devices = in.Name, in.Emoji, in.Color, in.Devices
+		d.Profiles = append(d.Profiles, p)
+		return nil
+	})
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, p)
+}
+
+func (s *Server) handleProfileUpdate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == store.EveryoneProfileID {
+		fail(w, 400, "The Everyone profile can't be edited.")
+		return
+	}
+	var in profileInput
+	if err := readJSON(r, &in); err != nil {
+		fail(w, 400, "Bad request.")
+		return
+	}
+	var updated store.Profile
+	found := false
+	err := s.store.Update(func(d *store.Data) error {
+		for i := range d.Profiles {
+			if d.Profiles[i].ID != id {
+				continue
+			}
+			found = true
+			if err := validateProfileInput(*d, &in, id); err != nil {
+				return err
+			}
+			d.Profiles[i].Name, d.Profiles[i].Emoji, d.Profiles[i].Color, d.Profiles[i].Devices = in.Name, in.Emoji, in.Color, in.Devices
+			updated = d.Profiles[i]
+			return nil
+		}
+		return nil
+	})
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	if !found {
+		fail(w, 404, "No such profile.")
+		return
+	}
+	writeJSON(w, 200, updated)
+}
+
+// deleteGatewayRules removes gateway rules by id, tolerating rules that
+// were already deleted behind our back.
+func (s *Server) deleteGatewayRules(ctx context.Context, ids []string) error {
+	api := s.api()
+	for _, id := range ids {
+		if err := api.DeleteTrafficRule(ctx, id); err != nil && !errors.Is(err, unifi.ErrNotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) handleProfileDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == store.EveryoneProfileID {
+		fail(w, 400, "The Everyone profile can't be deleted.")
+		return
+	}
+	d := s.store.Snapshot()
+	if _, ok := profileForID(d, id); !ok {
+		fail(w, 404, "No such profile.")
+		return
+	}
+	// Gateway first: remove this profile's rules so nothing keeps enforcing.
+	var gatewayIDs []string
+	for _, fr := range d.Rules {
+		if fr.ProfileID == id {
+			gatewayIDs = append(gatewayIDs, fr.UnifiRuleIDs...)
+		}
+	}
+	if err := s.deleteGatewayRules(r.Context(), gatewayIDs); err != nil {
+		failErr(w, err)
+		return
+	}
+	err := s.store.Update(func(d *store.Data) error {
+		kept := d.Rules[:0]
+		for _, fr := range d.Rules {
+			if fr.ProfileID != id {
+				kept = append(kept, fr)
+			}
+		}
+		d.Rules = kept
+		for i := range d.Profiles {
+			if d.Profiles[i].ID == id {
+				d.Profiles = append(d.Profiles[:i], d.Profiles[i+1:]...)
+				break
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}

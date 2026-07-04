@@ -1,0 +1,770 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#05070f">
+<meta name="description" content="Family Time — one-tap screen-time control for homes with a UniFi gateway. Pause kids' devices, set school-night schedules, block apps by name. No cloud, no subscription.">
+<title>Family Time — the internet has a bedtime now</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23070b14'/%3E%3Cpath d='M16 5L8 8v6c0 6 3.4 10 8 11.5C20.6 24 24 20 24 14V8l-8-3z' fill='%2322d3ee' fill-opacity='0.28' stroke='%2322d3ee' stroke-width='1.6'/%3E%3C/svg%3E">
+<style>
+/* ---------- tokens ---------- */
+:root{
+  --void:#05070f;
+  --void-2:#0a0f1c;
+  --panel:rgba(11,17,32,.62);
+  --panel-solid:#0b1120;
+  --text:#f3f6fb;
+  --dim:#97a3c2;
+  --cyan:#22d3ee;
+  --cyan-bright:#67e8f9;
+  --violet:#a78bfa;
+  --violet-bright:#c4b5fd;
+  --edge:rgba(143,165,255,.22);
+  --edge-hi:rgba(255,255,255,.16);
+  --ink:#06121a;
+  --font-display:"Space Grotesk","Avenir Next","Segoe UI Variable Display",system-ui,sans-serif;
+  --font-body:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  --font-mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,monospace;
+  --radius-lg:22px;
+  --radius-md:14px;
+  --glow-cyan:0 0 0 1px rgba(34,211,238,.35),0 0 28px -4px rgba(34,211,238,.55);
+  --glow-violet:0 0 0 1px rgba(167,139,250,.35),0 0 28px -4px rgba(167,139,250,.55);
+  --dur-sky:1.6s;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  background:var(--void);
+  color:var(--text);
+  font-family:var(--font-body);
+  font-size:1.0625rem;
+  line-height:1.6;
+  overflow-x:hidden;
+}
+::selection{background:rgba(34,211,238,.35)}
+
+/* ---------- the sky ---------- */
+.sky{
+  position:absolute;inset:0;z-index:-3;
+  background:
+    linear-gradient(180deg,
+      #0d1430 0%,
+      #111a3d 14%,
+      #17143a 26%,
+      #0e1128 40%,
+      #080c1c 60%,
+      var(--void) 82%);
+}
+.sky::after{ /* violet dusk horizon low in the hero */
+  content:"";position:absolute;left:0;right:0;top:38vh;height:70vh;
+  background:radial-gradient(60% 55% at 50% 45%,rgba(124,93,250,.20),transparent 70%);
+}
+.sky-night{
+  position:fixed;inset:0;z-index:-2;pointer-events:none;
+  background:radial-gradient(120% 90% at 50% 0%,#070b17 0%,var(--void) 60%);
+  opacity:0;transition:opacity var(--dur-sky) ease;
+}
+body.asleep .sky-night{opacity:.94}
+.stars{position:fixed;inset:0;z-index:-1;pointer-events:none}
+.stars span{
+  position:absolute;border-radius:50%;
+  background:#dbe6ff;
+  opacity:.16;
+  transition:opacity 1.2s ease;
+}
+body.asleep .stars span{opacity:var(--o,.9)}
+@keyframes twinkle{0%,100%{transform:scale(1)}50%{transform:scale(.45)}}
+body.asleep .stars span.tw{animation:twinkle 4s ease-in-out infinite}
+
+/* ---------- shared layout ---------- */
+.wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+section{padding:110px 0}
+.eyebrow{
+  font-family:var(--font-mono);font-size:.8125rem;font-weight:500;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--dim);
+  margin-bottom:14px;
+}
+h1,h2,h3{font-family:var(--font-display);font-weight:600;color:var(--text)}
+h2{font-size:2rem;letter-spacing:-.02em;line-height:1.15;margin-bottom:16px}
+h3{font-size:1.25rem;margin-bottom:10px}
+.lede{color:var(--dim);max-width:34rem}
+.lede b{color:var(--text);font-weight:500}
+
+/* glass panel */
+.glass{
+  background:var(--panel);
+  -webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);
+  border:1px solid var(--edge);
+  border-radius:var(--radius-lg);
+  box-shadow:0 24px 60px -30px rgba(0,0,0,.8),inset 0 1px 0 var(--edge-hi);
+}
+
+/* buttons */
+.btn{
+  display:inline-block;font-family:var(--font-display);font-weight:600;
+  font-size:1rem;text-decoration:none;border-radius:999px;
+  padding:14px 28px;letter-spacing:.01em;cursor:pointer;border:0;
+  transition:transform .2s ease,box-shadow .2s ease,background .2s ease;
+}
+.btn-primary{background:var(--cyan);color:var(--ink);box-shadow:var(--glow-cyan)}
+.btn-primary:hover{background:var(--cyan-bright);transform:translateY(-2px)}
+.btn-ghost{
+  background:rgba(255,255,255,.05);color:var(--text);
+  border:1px solid var(--edge);
+  -webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);
+}
+.btn-ghost:hover{border-color:rgba(143,165,255,.45);transform:translateY(-2px)}
+a:focus-visible,button:focus-visible{outline:2px solid var(--cyan);outline-offset:3px;border-radius:8px}
+.btn:focus-visible{border-radius:999px}
+
+/* ---------- nav ---------- */
+nav{position:absolute;top:0;left:0;right:0;z-index:10;padding:26px 0}
+nav .wrap{display:flex;align-items:center;justify-content:space-between}
+.brand{display:flex;align-items:center;gap:10px;text-decoration:none}
+.brand svg{display:block}
+.wordmark{font-family:var(--font-display);font-weight:600;font-size:1.125rem;color:var(--text);letter-spacing:-.01em}
+.nav-cta{font-size:.9375rem;padding:10px 20px}
+
+/* ---------- hero ---------- */
+.hero{
+  min-height:100svh;display:flex;flex-direction:column;justify-content:center;
+  text-align:center;position:relative;padding:140px 0 90px;
+}
+.hero h1{
+  font-size:clamp(2.6rem,6vw,4.5rem);
+  letter-spacing:-.03em;line-height:1.05;
+  max-width:15ch;margin:0 auto 22px;
+}
+.hero .lede{margin:0 auto 34px}
+.hero-ctas{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-bottom:64px}
+
+/* constellation behind hero copy */
+.constellation{
+  position:absolute;inset:0;z-index:-1;pointer-events:none;
+  display:flex;align-items:center;justify-content:center;
+}
+.constellation svg{width:min(920px,96vw);height:auto;opacity:.85}
+.c-line{
+  stroke:rgba(143,165,255,.30);stroke-width:1;
+  stroke-dasharray:600;stroke-dashoffset:0;
+  transition:opacity var(--dur-sky) ease;
+}
+body.asleep .c-line{opacity:.3}
+.c-star{fill:var(--cyan);transition:fill .5s ease}
+.c-halo{fill:none;stroke:rgba(34,211,238,.35);transition:stroke .5s ease}
+body.asleep .c-star{fill:var(--violet)}
+body.asleep .c-halo{stroke:rgba(167,139,250,.4)}
+body.asleep .c-star.d2,body.asleep .c-halo.d2{transition-delay:.15s}
+body.asleep .c-star.d3,body.asleep .c-halo.d3{transition-delay:.3s}
+body.asleep .c-star.d4,body.asleep .c-halo.d4{transition-delay:.45s}
+.c-label{
+  font-family:var(--font-mono);font-size:11px;letter-spacing:.14em;
+  fill:#97a3c2;
+}
+
+/* ---------- goodnight switch ---------- */
+.gn-zone{display:flex;flex-direction:column;align-items:center;gap:16px}
+.gn-switch{
+  position:relative;width:232px;height:76px;border-radius:999px;
+  background:var(--panel);
+  -webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);
+  border:1px solid var(--edge);
+  box-shadow:0 18px 50px -22px rgba(0,0,0,.85),inset 0 1px 0 var(--edge-hi);
+  cursor:pointer;
+}
+.gn-label{
+  position:absolute;top:50%;transform:translateY(-50%);
+  font-family:var(--font-mono);font-size:.8125rem;font-weight:500;
+  letter-spacing:.08em;text-transform:uppercase;color:var(--dim);
+  transition:opacity .4s ease;white-space:nowrap;
+}
+.gn-label-on{right:26px;opacity:1}
+.gn-label-bed{left:26px;opacity:0}
+body.asleep .gn-label-on{opacity:0}
+body.asleep .gn-label-bed{opacity:1}
+.gn-thumb{
+  position:absolute;top:7px;left:7px;width:60px;height:60px;border-radius:50%;
+  background:radial-gradient(circle at 35% 35%,var(--cyan-bright),var(--cyan) 65%);
+  box-shadow:var(--glow-cyan);
+  overflow:hidden;
+  transition:transform .6s cubic-bezier(.5,0,.2,1),background .6s ease,box-shadow .6s ease;
+}
+.gn-thumb::after{ /* the shadow disc that carves the crescent */
+  content:"";position:absolute;top:0;left:0;width:60px;height:60px;border-radius:50%;
+  background:var(--panel-solid);
+  transform:translate(64px,-64px);
+  transition:transform .6s cubic-bezier(.5,0,.2,1);
+}
+body.asleep .gn-thumb{
+  transform:translateX(157px);
+  background:radial-gradient(circle at 35% 35%,var(--violet-bright),var(--violet) 65%);
+  box-shadow:var(--glow-violet);
+}
+body.asleep .gn-thumb::after{transform:translate(20px,-14px)}
+.gn-hint{font-size:.875rem;color:var(--dim)}
+
+/* ---------- section 2: one tap + app mock ---------- */
+.split{display:grid;grid-template-columns:1fr 1fr;gap:64px;align-items:center}
+.mock{padding:26px;max-width:440px;justify-self:end;width:100%}
+.mock-head{display:flex;align-items:center;gap:12px;margin-bottom:18px}
+.avatar{
+  width:42px;height:42px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-size:20px;background:rgba(34,211,238,.12);border:1px solid rgba(34,211,238,.3);
+}
+.mock-head h3{margin:0;font-size:1.0625rem}
+.mock-head .sub{font-size:.8125rem;color:var(--dim)}
+.badge{
+  margin-left:auto;font-family:var(--font-mono);font-size:.6875rem;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--violet-bright);
+  border:1px solid rgba(167,139,250,.4);border-radius:999px;padding:4px 10px;
+  opacity:0;transition:opacity .5s ease;
+}
+body.asleep .badge{opacity:1}
+.mock-rows{display:flex;flex-direction:column;gap:2px;margin-bottom:16px}
+.mock-row{
+  display:flex;align-items:center;gap:12px;padding:11px 12px;
+  border-radius:var(--radius-md);background:rgba(255,255,255,.03);
+  border:1px solid transparent;margin-bottom:6px;
+}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--cyan);box-shadow:0 0 10px rgba(34,211,238,.6);transition:background .5s ease,box-shadow .5s ease}
+body.asleep .dot{background:var(--violet);box-shadow:0 0 10px rgba(167,139,250,.6)}
+body.asleep .mock-row:nth-child(2) .dot{transition-delay:.12s}
+body.asleep .mock-row:nth-child(3) .dot{transition-delay:.24s}
+.mock-row p{font-size:.9375rem}
+.dstate{margin-left:auto;font-family:var(--font-mono);font-size:.75rem;letter-spacing:.06em;position:relative;width:56px;text-align:right;height:1.1em}
+.dstate span{position:absolute;right:0;top:0;transition:opacity .5s ease}
+.dstate .on{color:var(--cyan);opacity:1}
+.dstate .off{color:var(--violet-bright);opacity:0}
+body.asleep .dstate .on{opacity:0}
+body.asleep .dstate .off{opacity:1}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+.chip{
+  font-family:var(--font-mono);font-size:.75rem;letter-spacing:.04em;color:var(--dim);
+  border:1px solid var(--edge);border-radius:999px;padding:6px 13px;
+  background:rgba(255,255,255,.03);
+}
+.mock-btn{
+  width:100%;padding:14px;border-radius:var(--radius-md);border:0;cursor:pointer;
+  font-family:var(--font-display);font-weight:600;font-size:1rem;
+  background:var(--cyan);color:var(--ink);box-shadow:var(--glow-cyan);
+  transition:background .5s ease,box-shadow .5s ease,color .5s ease;
+  position:relative;
+}
+body.asleep .mock-btn{background:var(--violet);box-shadow:var(--glow-violet);color:#160f2e}
+.mock-btn .bl{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;transition:opacity .4s ease}
+.mock-btn .bl-good{opacity:1}
+.mock-btn .bl-resume{opacity:0}
+body.asleep .mock-btn .bl-good{opacity:0}
+body.asleep .mock-btn .bl-resume{opacity:1}
+.mock-note{
+  text-align:center;font-size:.8125rem;color:var(--dim);
+  margin-top:14px;margin-bottom:-6px;opacity:0;transition:opacity .6s ease .5s;
+}
+body.asleep .mock-note{opacity:1}
+
+/* ---------- section 3: schedules ---------- */
+.timelines{display:flex;flex-direction:column;gap:34px;margin-top:56px}
+.tl-row{display:grid;grid-template-columns:180px 1fr;gap:24px;align-items:center}
+.tl-name{font-family:var(--font-display);font-weight:600;font-size:1.0625rem}
+.tl-name small{display:block;font-family:var(--font-mono);font-weight:400;font-size:.75rem;letter-spacing:.08em;color:var(--dim);margin-top:3px;text-transform:uppercase}
+.tl-track{
+  position:relative;height:46px;border-radius:999px;
+  background:linear-gradient(90deg,rgba(34,211,238,.07),rgba(11,17,32,.75) 35%,rgba(11,17,32,.75) 70%,rgba(34,211,238,.07));
+  border:1px solid var(--edge);
+}
+.tl-tick{
+  position:absolute;top:50%;transform:translateY(-50%);
+  font-family:var(--font-mono);font-size:.6875rem;letter-spacing:.06em;color:var(--dim);
+}
+.tl-tick.l{left:14px}
+.tl-tick.r{right:14px}
+.tl-window{
+  position:absolute;top:5px;bottom:5px;left:var(--start);width:var(--w);
+  border-radius:999px;
+  background:linear-gradient(180deg,rgba(167,139,250,.5),rgba(124,93,250,.32));
+  border:1px solid rgba(167,139,250,.55);
+  box-shadow:0 0 22px -4px rgba(167,139,250,.5);
+  transform:scaleX(0);transform-origin:left center;
+  transition:transform 1.1s cubic-bezier(.4,0,.2,1);
+}
+.inview .tl-window{transform:scaleX(1)}
+.tl-time{
+  position:absolute;top:-26px;font-family:var(--font-mono);font-size:.75rem;
+  letter-spacing:.05em;color:var(--violet-bright);white-space:nowrap;
+  opacity:0;transition:opacity .6s ease .7s;
+}
+.inview .tl-time{opacity:1}
+.tl-time.l{left:0}
+.tl-time.r{right:0}
+.tl-moon{position:absolute;right:10px;top:50%;transform:translateY(-50%);font-size:13px;line-height:1;opacity:.9}
+
+/* ---------- section 4: two cards ---------- */
+.cards2{display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-top:52px}
+.card{padding:34px 32px}
+.card .lede{font-size:1rem;margin-bottom:22px}
+.tagchips{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:20px}
+.tagchip{
+  font-family:var(--font-mono);font-size:.75rem;letter-spacing:.1em;
+  color:var(--cyan-bright);border:1px solid rgba(34,211,238,.35);
+  background:rgba(34,211,238,.07);border-radius:999px;padding:8px 15px;
+}
+.foot-note{font-size:.875rem;color:var(--dim)}
+.block-list{list-style:none;display:flex;flex-direction:column;gap:8px}
+.block-list li{
+  display:flex;align-items:center;gap:12px;padding:12px 14px;
+  border-radius:var(--radius-md);background:rgba(255,255,255,.03);
+}
+.block-list .site{font-size:.9375rem}
+.block-list .site small{display:block;font-family:var(--font-mono);font-size:.75rem;color:var(--dim);letter-spacing:.03em}
+.rule-tag{
+  margin-left:auto;font-family:var(--font-mono);font-size:.6875rem;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--violet-bright);
+  border:1px solid rgba(167,139,250,.4);background:rgba(167,139,250,.08);
+  border-radius:999px;padding:4px 10px;white-space:nowrap;
+}
+.b-ico{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:16px;background:rgba(255,255,255,.05);border:1px solid var(--edge)}
+
+/* ---------- section 5: how it works ---------- */
+.how{max-width:680px;margin:0 auto}
+.steps{counter-reset:step;display:flex;flex-direction:column;gap:14px;margin:48px 0 40px}
+.step{display:flex;gap:20px;padding:24px 26px}
+.step-n{
+  counter-increment:step;flex:none;width:44px;height:44px;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--font-mono);font-size:1rem;color:var(--cyan-bright);
+  border:1px solid rgba(34,211,238,.4);background:rgba(34,211,238,.08);
+}
+.step-n::before{content:counter(step)}
+.step h3{font-size:1.125rem;margin-bottom:4px}
+.step p{color:var(--dim);font-size:.9375rem}
+.trust{list-style:none;display:flex;flex-direction:column;gap:14px}
+.trust li{display:flex;gap:12px;color:var(--dim);font-size:.9375rem;align-items:flex-start}
+.trust li b{color:var(--text);font-weight:500}
+.trust .t-ico{flex:none;margin-top:2px}
+
+/* ---------- final ---------- */
+.final{text-align:center;padding:150px 0 60px}
+.final h2{font-size:clamp(2rem,4.5vw,3rem);letter-spacing:-.03em;margin-bottom:26px}
+.final .gn-hint{margin-top:18px}
+footer{padding:40px 0 48px}
+footer .wrap{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+footer p{font-size:.875rem;color:var(--dim)}
+footer .fbrand{display:flex;align-items:center;gap:9px}
+footer .fbrand span{font-family:var(--font-display);font-weight:600;font-size:.9375rem;color:var(--text)}
+
+/* ---------- reveal on load / scroll ---------- */
+@keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.rise{animation:fadeUp .7s ease both}
+.rise.r2{animation-delay:.06s}
+.rise.r3{animation-delay:.12s}
+.rise.r4{animation-delay:.18s}
+.rise.r5{animation-delay:.24s}
+@keyframes drawline{from{stroke-dashoffset:600}to{stroke-dashoffset:0}}
+.c-line{animation:drawline 1.2s ease .3s both}
+
+/* ---------- reduced motion ---------- */
+@media (prefers-reduced-motion:reduce){
+  html{scroll-behavior:auto}
+  *,*::before,*::after{transition-duration:.15s !important;animation:none !important}
+  .rise{opacity:1;transform:none}
+  .c-line{stroke-dashoffset:0}
+  .tl-window{transform:scaleX(1)}
+  .tl-time{opacity:1}
+}
+
+/* ---------- responsive ---------- */
+@media (max-width:860px){
+  section{padding:80px 0}
+  .split{grid-template-columns:1fr;gap:44px}
+  .mock{justify-self:stretch;max-width:none}
+  .cards2{grid-template-columns:1fr}
+  .tl-row{grid-template-columns:1fr;gap:36px}
+  .tl-name{margin-bottom:-22px}
+  .constellation svg{opacity:.4}
+  .hero{padding-top:120px}
+}
+@media (max-width:480px){
+  .hero h1{font-size:2.35rem}
+  .hero-ctas .btn{width:100%;text-align:center}
+  .step{flex-direction:column;gap:12px}
+}
+
+/* ---------- screens: gallery + enrollment ---------- */
+.shots{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-top:44px}
+.shot{overflow:hidden;padding:0;margin:0}
+.shot-bar{display:flex;gap:6px;padding:12px 14px;border-bottom:1px solid var(--edge)}
+.shot-bar span{width:10px;height:10px;border-radius:50%;background:rgba(255,255,255,.14)}
+.shot img{display:block;width:100%;height:auto}
+.shot figcaption{padding:14px 16px;color:var(--dim);font-size:.9375rem}
+.enroll-grid{display:grid;grid-template-columns:1fr 1fr;gap:48px;align-items:center}
+.enroll-steps{list-style:none;margin-top:28px;display:grid;gap:14px}
+.enroll-steps li{display:flex;align-items:center;gap:14px;color:var(--text)}
+.enroll-step-n{width:30px;height:30px;border-radius:50%;flex:none;display:inline-flex;align-items:center;justify-content:center;
+  font-family:var(--font-mono);font-size:.875rem;color:var(--cyan-bright);
+  background:rgba(34,211,238,.10);border:1px solid rgba(34,211,238,.35)}
+.enroll-shots{display:flex;gap:20px;justify-content:center}
+.phone{overflow:hidden;padding:0;margin:0;max-width:230px;border-radius:28px}
+.phone img{display:block;width:100%;height:auto}
+.phone figcaption{padding:12px 14px;color:var(--dim);font-size:.875rem;text-align:center}
+@media (max-width:880px){
+  .shots{grid-template-columns:1fr}
+  .enroll-grid{grid-template-columns:1fr;gap:36px}
+  .enroll-shots{flex-wrap:wrap}
+}
+</style>
+</head>
+<body>
+
+<div class="sky" aria-hidden="true"></div>
+<div class="sky-night" aria-hidden="true"></div>
+<div class="stars" id="stars" aria-hidden="true"></div>
+
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#">
+      <svg viewBox="0 0 24 24" width="26" height="26" fill="none" aria-hidden="true"><path d="M12 2.3L4.4 5.3V11C4.4 16.4 7.8 20.9 12 22.1C16.2 20.9 19.6 16.4 19.6 11V5.3L12 2.3Z" fill="#22d3ee" fill-opacity="0.2" stroke="#22d3ee" stroke-width="1.4" stroke-linejoin="round"/></svg>
+      <span class="wordmark">Family Time</span>
+    </a>
+    <a class="btn btn-ghost nav-cta" href="#how">Get it free</a>
+  </div>
+</nav>
+
+<!-- ============ HERO ============ -->
+<header class="hero">
+  <div class="constellation" aria-hidden="true">
+    <svg viewBox="0 0 800 420">
+      <line class="c-line" x1="88" y1="118" x2="710" y2="58"/>
+      <line class="c-line" x1="710" y1="58" x2="736" y2="326"/>
+      <line class="c-line" x1="736" y1="326" x2="120" y2="348"/>
+      <circle class="c-halo d1" cx="88" cy="118" r="10"/>
+      <circle class="c-star d1" cx="88" cy="118" r="4.5"/>
+      <text class="c-label" x="96" y="148" text-anchor="middle">EMMA'S IPAD</text>
+      <circle class="c-halo d2" cx="710" cy="58" r="10"/>
+      <circle class="c-star d2" cx="710" cy="58" r="4.5"/>
+      <text class="c-label" x="702" y="34" text-anchor="middle">THE BOYS' ROOM</text>
+      <circle class="c-halo d3" cx="736" cy="326" r="10"/>
+      <circle class="c-star d3" cx="736" cy="326" r="4.5"/>
+      <text class="c-label" x="730" y="358" text-anchor="middle">LIVING ROOM TV</text>
+      <circle class="c-halo d4" cx="120" cy="348" r="10"/>
+      <circle class="c-star d4" cx="120" cy="348" r="4.5"/>
+      <text class="c-label" x="128" y="380" text-anchor="middle">KITCHEN TABLET</text>
+    </svg>
+  </div>
+  <div class="wrap">
+    <p class="eyebrow rise">Made for UniFi homes</p>
+    <h1 class="rise r2">The internet has a bedtime now.</h1>
+    <p class="lede rise r3" style="text-align:center">One tap pauses your kids' devices. Schedules handle school nights so you don't have to. And it all runs in your own house — no cloud account, no monthly fee.</p>
+    <div class="hero-ctas rise r4">
+      <a class="btn btn-primary" href="#how">Get Family Time — free</a>
+      <a class="btn btn-ghost" href="#onetap">See how it works</a>
+    </div>
+    <div class="gn-zone rise r5">
+      <button class="gn-switch" id="gnSwitch" aria-pressed="false" aria-label="Goodnight switch">
+        <span class="gn-label gn-label-bed">Bedtime</span>
+        <span class="gn-label gn-label-on">Screens on</span>
+        <span class="gn-thumb" aria-hidden="true"></span>
+      </button>
+      <p class="gn-hint">Go ahead — try it.</p>
+    </div>
+  </div>
+</header>
+
+<!-- ============ ONE TAP ============ -->
+<section id="onetap">
+  <div class="wrap split">
+    <div>
+      <p class="eyebrow">One tap</p>
+      <h2>Lights out, one tap.</h2>
+      <p class="lede">No menus, no negotiating. Tap once and every kids' device pauses together — screens go quiet, and so does the house.</p>
+      <br>
+      <p class="lede">Dinner's on the table and nobody's heard you twice? Pause for 15, 30, or 60 minutes — it takes effect immediately, and turns everything back on by itself.</p>
+    </div>
+    <div class="mock glass" aria-label="Preview of the Family Time app">
+      <div class="mock-head">
+        <span class="avatar" aria-hidden="true">🧒</span>
+        <div>
+          <h3>The kids</h3>
+          <p class="sub">3 devices</p>
+        </div>
+        <span class="badge">Asleep</span>
+      </div>
+      <div class="mock-rows">
+        <div class="mock-row">
+          <span class="dot" aria-hidden="true"></span>
+          <p>Emma's iPad</p>
+          <span class="dstate"><span class="on">Online</span><span class="off">Asleep</span></span>
+        </div>
+        <div class="mock-row">
+          <span class="dot" aria-hidden="true"></span>
+          <p>Sam's Switch</p>
+          <span class="dstate"><span class="on">Online</span><span class="off">Asleep</span></span>
+        </div>
+        <div class="mock-row">
+          <span class="dot" aria-hidden="true"></span>
+          <p>Living room TV</p>
+          <span class="dstate"><span class="on">Online</span><span class="off">Asleep</span></span>
+        </div>
+      </div>
+      <div class="chips" aria-hidden="true">
+        <span class="chip">15m</span><span class="chip">30m</span><span class="chip">1h</span><span class="chip">Until morning</span>
+      </div>
+      <button class="mock-btn" id="mockBtn" aria-pressed="false" aria-label="Goodnight — pause these devices">
+        <span class="bl bl-good">Goodnight</span>
+        <span class="bl bl-resume">Resume</span>
+        &nbsp;
+      </button>
+      <p class="mock-note" aria-hidden="true">That's it. That's the whole app.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ SCHEDULES ============ -->
+<section id="schedules">
+  <div class="wrap">
+    <p class="eyebrow">Schedules</p>
+    <h2>Set it on Sunday, forget it all week.</h2>
+    <p class="lede">Set it once and never think about it again. Family Time flips the switch on time, every time — the schedule gets to be the bad guy, not you. And weekends get their own rules, so Saturday morning cartoons still work.</p>
+    <div class="timelines" id="tl">
+      <div class="tl-row">
+        <p class="tl-name">School nights<small>Sun – Thu</small></p>
+        <div class="tl-track">
+          <span class="tl-tick l" aria-hidden="true">3 PM</span>
+          <div class="tl-window" style="--start:30.5%;--w:58.5%">
+            <span class="tl-time l">8:30 PM</span>
+            <span class="tl-time r">7:00 AM</span>
+            <span class="tl-moon" aria-hidden="true">☾</span>
+          </div>
+          <span class="tl-tick r" aria-hidden="true">9 AM</span>
+        </div>
+      </div>
+      <div class="tl-row">
+        <p class="tl-name">Weekends<small>Fri – Sat</small></p>
+        <div class="tl-track">
+          <span class="tl-tick l" aria-hidden="true">3 PM</span>
+          <div class="tl-window" style="--start:38.9%;--w:53%">
+            <span class="tl-time l">10:00 PM</span>
+            <span class="tl-time r">8:00 AM</span>
+            <span class="tl-moon" aria-hidden="true">☾</span>
+          </div>
+          <span class="tl-tick r" aria-hidden="true">9 AM</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ DEVICES & BLOCKING ============ -->
+<section id="devices">
+  <div class="wrap">
+    <p class="eyebrow">Groups &amp; rules</p>
+    <h2>Made for how your family actually works.</h2>
+    <div class="cards2">
+      <div class="card glass">
+        <h3>Their devices, by name.</h3>
+        <p class="lede">Tag the iPad as Emma's. Group the consoles as The Boys' Room. Pause one kid, every kid, or the whole house.</p>
+        <div class="tagchips" aria-hidden="true">
+          <span class="tagchip">EMMA'S IPAD</span>
+          <span class="tagchip">THE BOYS' ROOM</span>
+          <span class="tagchip">KITCHEN TABLET</span>
+          <span class="tagchip">LIVING ROOM TV</span>
+        </div>
+        <p class="foot-note">Pause them one at a time, by group, or all at once.</p>
+      </div>
+      <div class="card glass">
+        <h3>Some apps aren't for school nights.</h3>
+        <p class="lede">Block specific apps and sites — for one group or the whole house. YouTube can wait until Saturday.</p>
+        <ul class="block-list">
+          <li><span class="b-ico" aria-hidden="true">▶</span><span class="site">YouTube<small>youtube.com</small></span><span class="rule-tag">School nights</span></li>
+          <li><span class="b-ico" aria-hidden="true">🎮</span><span class="site">Roblox<small>roblox.com</small></span><span class="rule-tag">After 8:30 PM</span></li>
+          <li><span class="b-ico" aria-hidden="true">♪</span><span class="site">TikTok<small>tiktok.com</small></span><span class="rule-tag">Everyone, always</span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ ENROLLMENT ============ -->
+<section id="enroll">
+  <div class="wrap enroll-grid">
+    <div>
+      <p class="eyebrow">Adding a device</p>
+      <h2>Add a device in seconds.</h2>
+      <p class="lede">No MAC addresses. No router tables. Open one link on the device you're adding — Family Time recognizes it from its own connection, even when iPhones randomize their Wi-Fi address. Give it a name, pick its group, done.</p>
+      <ol class="enroll-steps">
+        <li><span class="enroll-step-n" aria-hidden="true">1</span>Open the link on their device</li>
+        <li><span class="enroll-step-n" aria-hidden="true">2</span>Pick a name &amp; group</li>
+        <li><span class="enroll-step-n" aria-hidden="true">3</span>Done — rules apply instantly</li>
+      </ol>
+    </div>
+    <div class="enroll-shots">
+      <figure class="phone glass">
+        <img src="assets/enroll-found.png" width="390" height="844" loading="lazy" decoding="async"
+             alt="Enrollment screen on a phone: Family Time found the visiting device and shows iPhone 72:68 with its network details.">
+        <figcaption>It knows which device you're holding.</figcaption>
+      </figure>
+      <figure class="phone glass">
+        <img src="assets/enroll-ready.png" width="390" height="844" loading="lazy" decoding="async"
+             alt="Enrollment screen with the device renamed to Ava's iPhone and the Kids group selected, ready to finish.">
+        <figcaption>Name it, pick a group, done.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<!-- ============ QUIET DIFFERENTIATORS ============ -->
+<section id="sturdy">
+  <div class="wrap">
+    <p class="eyebrow">Built to hold</p>
+    <h2>The parts you'll never have to think about.</h2>
+    <div class="cards2">
+      <div class="card glass">
+        <h3>It keeps working even when the app is closed.</h3>
+        <p class="lede">Family Time writes its rules into the network box you already own, schedule and all. Close the app, reboot the computer it runs on — bedtime still happens.</p>
+        <p class="foot-note">Your UniFi gateway does the enforcing.</p>
+      </div>
+      <div class="card glass">
+        <h3>Built for iPhone privacy features.</h3>
+        <p class="lede">iPhones hide behind a randomized Wi-Fi address, which is why they show up in router lists as "iPhone 72:68." Family Time recognizes the device by its live connection instead, so enrollment just works.</p>
+        <p class="foot-note">Apple's default Private Wi-Fi Address? Still works.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ SEE IT ============ -->
+<section id="peek">
+  <div class="wrap">
+    <p class="eyebrow">A quick look</p>
+    <h2>Calm control, one screen at a time.</h2>
+    <p class="lede">The whole app is a handful of quiet screens. Here are the three you'll live in.</p>
+    <div class="shots">
+      <figure class="shot glass">
+        <div class="shot-bar" aria-hidden="true"><span></span><span></span><span></span></div>
+        <img src="assets/home.png" width="1280" height="1300" loading="lazy" decoding="async"
+             alt="Family Time home screen: quick-pause cards for each group with 15 minute, 30 minute, one hour, until-morning options, a Starting selector to schedule the pause for a little later, and a scheduled pause showing when it will begin.">
+        <figcaption>Home — pause a group now, or in a little while.</figcaption>
+      </figure>
+      <figure class="shot glass">
+        <div class="shot-bar" aria-hidden="true"><span></span><span></span><span></span></div>
+        <img src="assets/rules.png" width="1280" height="1300" loading="lazy" decoding="async"
+             alt="Family Time rules screen: a searchable list of family rules like school-night YouTube blocks with on-off toggles.">
+        <figcaption>Rules — every boundary, one calm list.</figcaption>
+      </figure>
+      <figure class="shot glass">
+        <div class="shot-bar" aria-hidden="true"><span></span><span></span><span></span></div>
+        <img src="assets/groups.png" width="1280" height="1300" loading="lazy" decoding="async"
+             alt="Family Time groups and devices screen: kids' devices tagged by name and organized into groups.">
+        <figcaption>Groups &amp; Devices — name a device once. Done.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<!-- ============ HOW IT WORKS ============ -->
+<section id="how">
+  <div class="wrap how">
+    <p class="eyebrow">In your house</p>
+    <h2>Runs in your house, not someone's cloud.</h2>
+    <p class="lede">Family Time is one small program on your own network that talks directly to your UniFi gateway. Three steps and you're done.</p>
+    <div class="steps">
+      <div class="step glass">
+        <span class="step-n" aria-hidden="true"></span>
+        <div>
+          <h3>Download and run it.</h3>
+          <p>One small file that lives on your own network — a laptop, a mini PC, anything that stays on.</p>
+        </div>
+      </div>
+      <div class="step glass">
+        <span class="step-n" aria-hidden="true"></span>
+        <div>
+          <h3>Paste in your UniFi key.</h3>
+          <p>It's a code from your UniFi settings — the setup wizard shows you exactly where to find it, once, and you're done.</p>
+        </div>
+      </div>
+      <div class="step glass">
+        <span class="step-n" aria-hidden="true"></span>
+        <div>
+          <h3>Name the kids' devices.</h3>
+          <p>Pick them from a list and give them names you'd actually say out loud.</p>
+        </div>
+      </div>
+    </div>
+    <ul class="trust">
+      <li><svg class="t-ico" viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true"><path d="M4 12a8 8 0 1116 0 8 8 0 01-16 0z" stroke="#22d3ee" stroke-width="1.5"/><path d="M12 8v4l2.5 1.5" stroke="#22d3ee" stroke-width="1.5" stroke-linecap="round"/></svg><span><b>Nothing about your family leaves the house.</b> It talks only to your own gateway, on your own Wi-Fi.</span></li>
+      <li><svg class="t-ico" viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2.5" stroke="#22d3ee" stroke-width="1.5"/><path d="M8 10V7a4 4 0 118 0v3" stroke="#22d3ee" stroke-width="1.5"/></svg><span><b>No account. No subscription. No app store.</b> A parent PIN keeps the controls with you.</span></li>
+      <li><svg class="t-ico" viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true"><path d="M12 2.3L4.4 5.3V11C4.4 16.4 7.8 20.9 12 22.1C16.2 20.9 19.6 16.4 19.6 11V5.3L12 2.3Z" stroke="#22d3ee" stroke-width="1.5" stroke-linejoin="round"/><path d="M8.7 12.3L11 14.6L15.4 9.8" stroke="#22d3ee" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg><span><b>Free and yours to keep.</b> One small program, no strings attached.</span></li>
+    </ul>
+  </div>
+</section>
+
+<!-- ============ FINAL CTA ============ -->
+<section class="final">
+  <div class="wrap">
+    <h2>Tonight: one tap.</h2>
+    <a class="btn btn-primary" href="#how">Get Family Time — free</a>
+    <p class="gn-hint">One file. Your network. Goodnight.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="fbrand">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" aria-hidden="true"><path d="M12 2.3L4.4 5.3V11C4.4 16.4 7.8 20.9 12 22.1C16.2 20.9 19.6 16.4 19.6 11V5.3L12 2.3Z" fill="#22d3ee" fill-opacity="0.2" stroke="#22d3ee" stroke-width="1.4" stroke-linejoin="round"/></svg>
+      <span>Family Time</span>
+    </div>
+    <p>Built for UniFi Cloud Gateways · Screens off, lights out.</p>
+  </div>
+</footer>
+
+<script>
+(function(){
+  "use strict";
+
+  /* ----- stars ----- */
+  var stars = document.getElementById('stars');
+  var frag = document.createDocumentFragment();
+  for (var i = 0; i < 70; i++) {
+    var s = document.createElement('span');
+    var sz = Math.random() < 0.75 ? 1 : 2;
+    s.style.width = sz + 'px';
+    s.style.height = sz + 'px';
+    s.style.left = (Math.random() * 100).toFixed(2) + '%';
+    s.style.top = (Math.random() * 100).toFixed(2) + '%';
+    s.style.setProperty('--o', (0.5 + Math.random() * 0.5).toFixed(2));
+    s.style.transitionDelay = (Math.random() * 0.9).toFixed(2) + 's';
+    if (Math.random() < 0.18) {
+      s.className = 'tw';
+      s.style.animationDelay = (Math.random() * 4).toFixed(2) + 's';
+    }
+    frag.appendChild(s);
+  }
+  stars.appendChild(frag);
+
+  /* ----- goodnight switch (shared state) ----- */
+  var gn = document.getElementById('gnSwitch');
+  var mock = document.getElementById('mockBtn');
+  function setAsleep(asleep) {
+    document.body.classList.toggle('asleep', asleep);
+    gn.setAttribute('aria-pressed', String(asleep));
+    mock.setAttribute('aria-pressed', String(asleep));
+  }
+  function toggle() { setAsleep(!document.body.classList.contains('asleep')); }
+  gn.addEventListener('click', toggle);
+  mock.addEventListener('click', toggle);
+
+  /* ----- scroll reveals (timeline fill) ----- */
+  if ('IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if (e.isIntersecting) { e.target.classList.add('inview'); io.unobserve(e.target); }
+      });
+    }, {threshold: 0.35});
+    io.observe(document.getElementById('tl'));
+  } else {
+    document.getElementById('tl').classList.add('inview');
+  }
+})();
+</script>
+</body>
+</html>

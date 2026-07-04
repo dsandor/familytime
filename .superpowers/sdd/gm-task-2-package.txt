@@ -1,0 +1,102 @@
+# Review package — GM Task 2 (no git; diff = pre-task snapshot vs working tree)
+
+## Full diff (unified, 10 context lines)
+diff -ruN -U10 -x '*.min.js' -x assets /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-gm-2/web/static/css/app.css web/static/css/app.css
+--- /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-gm-2/web/static/css/app.css	2026-07-03 21:52:01.000000000 -0400
++++ web/static/css/app.css	2026-07-03 22:35:49.647781681 -0400
+@@ -483,20 +483,24 @@
+ .pause-start { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 16px; }
+ .pause-start .label { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--text-dim); margin-right: 2px; }
+ .pause-start .chip { padding: 6px 12px; font-size: 13px; border-radius: var(--radius-full); }
+ .pause-start .chip.on { border-color: var(--cyan); background: rgba(34, 211, 238, .12); color: var(--cyan-bright); box-shadow: var(--shadow-glow-cyan); }
+ 
+ .badge.badge-scheduled { background: rgba(251, 191, 36, .15); color: #fcd34d; }
+ .badge.badge-scheduled::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: #fbbf24; box-shadow: 0 0 6px rgba(251, 191, 36, .8); }
+ 
+ .pausebox.scheduled { background: rgba(251, 191, 36, .07); border-color: rgba(251, 191, 36, .22); }
+ 
++.pausebox-actions { display: flex; align-items: center; gap: 8px; flex: none; }
++.pausebox button.more { padding: 10px 14px; font-size: 13px; font-weight: 600; color: var(--text-dim); background: none; border: 1px solid var(--glass-border); border-radius: var(--radius-full); white-space: nowrap; }
++.pausebox button.more:hover:not(:disabled) { color: var(--cyan-bright); background: var(--glass-fill); }
++
+ /* Active-now / upcoming ledgers */
+ .ledger { list-style: none; padding: 0; margin: 0; }
+ .ledger-row {
+   display: flex;
+   align-items: center;
+   gap: 12px;
+   padding: 14px 4px;
+   border-top: 1px solid var(--glass-border);
+ }
+ .ledger-row:first-child { border-top: none; }
+diff -ruN -U10 -x '*.min.js' -x assets /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-gm-2/web/static/index.html web/static/index.html
+--- /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-gm-2/web/static/index.html	2026-07-03 21:51:54.000000000 -0400
++++ web/static/index.html	2026-07-03 22:35:45.408159508 -0400
+@@ -181,28 +181,34 @@
+                   <button class="chip secondary" @click="pause(p.id,'morning')">Until morning</button>
+                   <button class="chip secondary" @click="pause(p.id,'indefinite')"
+                           :disabled="groupDelay(p.id) !== 'now'"
+                           :title="groupDelay(p.id) !== 'now' ? 'Scheduled pauses need an end time — pick a timed duration.' : ''">Until I resume</button>
+                 </div>
+               </div>
+             </template>
+             <template x-if="groupPause(p.id)">
+               <div class="pausebox">
+                 <p class="sub">Paused<span x-show="groupPause(p.id).until" x-text="' until ' + fmtTime(groupPause(p.id).until)"></span></p>
+-                <button class="primary" @click="unpause(p.id)">Resume</button>
++                <div class="pausebox-actions">
++                  <button class="more" @click="grantMore(p.id)">30 more min</button>
++                  <button class="primary" @click="unpause(p.id)">Resume</button>
++                </div>
+               </div>
+             </template>
+             <template x-if="groupPending(p.id)">
+               <div class="pausebox scheduled">
+                 <p class="sub" x-text="'Pauses at ' + fmtTime(groupPending(p.id).startsAt)
+                   + (groupPending(p.id).until ? ' · until ' + fmtTime(groupPending(p.id).until) : '')"></p>
+-                <button class="primary" @click="unpause(p.id)">Cancel</button>
++                <div class="pausebox-actions">
++                  <button class="more" @click="grantMore(p.id)">+30 min</button>
++                  <button class="primary" @click="unpause(p.id)">Cancel</button>
++                </div>
+               </div>
+             </template>
+ 
+             <button class="ghost" @click="goRules(p.id)">Manage rules →</button>
+           </div>
+         </template>
+         <p class="center-note sub" x-show="profiles.length===0">
+           Add your first group in <b>Groups &amp; Devices</b> to start pausing internet access.
+         </p>
+       </section>
+diff -ruN -U10 -x '*.min.js' -x assets /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-gm-2/web/static/js/app.js web/static/js/app.js
+--- /private/tmp/claude-501/-Users-dsandor-Projects-bedtime/18358d72-697b-4c57-9c0f-c8083c1d9c54/scratchpad/snap/pre-gm-2/web/static/js/app.js	2026-07-03 22:09:14.000000000 -0400
++++ web/static/js/app.js	2026-07-03 22:35:38.575410048 -0400
+@@ -420,20 +420,27 @@
+         await this.loadCore();
+       }
+       catch (e) { this.banner = e.message; }
+     },
+ 
+     async unpause(profileId) {
+       try { await this.api('DELETE', '/api/pause/' + profileId); await this.loadCore(); }
+       catch (e) { this.banner = e.message; }
+     },
+ 
++    // grantMore lifts the current pause (or pushes a scheduled one) and
++    // re-engages it 30 minutes later, keeping its original end.
++    async grantMore(profileId) {
++      try { await this.api('POST', '/api/pause/' + profileId + '/delay', { delay: '30m' }); await this.loadCore(); }
++      catch (e) { this.banner = e.message; }
++    },
++
+     // ---------- Groups & Devices ----------
+ 
+     filteredDevices() {
+       const q = this.deviceQuery.trim().toLowerCase();
+       if (!q) return this.devices;
+       return this.devices.filter(d => (d.name || '').toLowerCase().includes(q) || (d.mac || '').toLowerCase().includes(q));
+     },
+ 
+     // memberSummary is the Groups list's secondary line — the point is to
+     // make membership visible without opening the editor, so it lists

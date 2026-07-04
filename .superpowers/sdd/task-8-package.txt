@@ -1,0 +1,1208 @@
+# Task 8 review package
+# vendored alpine.min.js excluded from package; verify:    44758 bytes, first 60 chars: (()=>{var nt=!1,it=!1,W=[],ot=-1;function Ut(e){Rn(e)}functi
+
+=================== FILE: internal/server/auth.go ===================
+package server
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/crypto/bcrypt"
+
+	"bedtime/internal/store"
+	"bedtime/internal/unifi"
+)
+
+const (
+	sessionCookie = "bedtime_session"
+	sessionTTL    = 30 * 24 * time.Hour
+)
+
+var pinRe = regexp.MustCompile(`^[0-9]{4,6}$`)
+
+func hashPIN(pin string) (string, error) {
+	if !pinRe.MatchString(pin) {
+		return "", fmt.Errorf("PIN must be 4–6 digits")
+	}
+	h, err := bcrypt.GenerateFromPassword([]byte(pin), bcrypt.DefaultCost)
+	return string(h), err
+}
+
+func checkPIN(hash, pin string) bool {
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(pin)) == nil
+}
+
+func newSecret() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func sign(secret string, expiry int64) string {
+	m := hmac.New(sha256.New, []byte(secret))
+	fmt.Fprintf(m, "%d", expiry)
+	return hex.EncodeToString(m.Sum(nil))
+}
+
+func (s *Server) issueSession(w http.ResponseWriter) {
+	secret := s.store.Snapshot().Auth.SessionSecret
+	exp := s.now().Add(sessionTTL).Unix()
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    fmt.Sprintf("%d.%s", exp, sign(secret, exp)),
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(sessionTTL.Seconds()),
+	})
+}
+
+func (s *Server) clearSession(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1})
+}
+
+func (s *Server) validSession(r *http.Request) bool {
+	c, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return false
+	}
+	expStr, sig, ok := strings.Cut(c.Value, ".")
+	if !ok {
+		return false
+	}
+	exp, err := strconv.ParseInt(expStr, 10, 64)
+	if err != nil || s.now().Unix() > exp {
+		return false
+	}
+	secret := s.store.Snapshot().Auth.SessionSecret
+	if secret == "" {
+		return false
+	}
+	return hmac.Equal([]byte(sig), []byte(sign(secret, exp)))
+}
+
+// auth wraps protected handlers with session validation.
+func (s *Server) auth(h http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.validSession(r) {
+			fail(w, http.StatusUnauthorized, "Please enter your PIN.")
+			return
+		}
+		h(w, r)
+	})
+}
+
+// loginGuard rate-limits PIN attempts: after 5 consecutive failures the
+// login locks, doubling from 30s up to 15min.
+type loginGuard struct {
+	mu          sync.Mutex
+	fails       int
+	lockedUntil time.Time
+}
+
+func (g *loginGuard) allowed(now time.Time) (bool, time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if now.Before(g.lockedUntil) {
+		return false, time.Until(g.lockedUntil)
+	}
+	return true, 0
+}
+
+func (g *loginGuard) fail(now time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.fails++
+	if g.fails >= 5 {
+		lock := 30 * time.Second << uint(min(g.fails-5, 5)) // 30s → 16m cap
+		if lock > 15*time.Minute {
+			lock = 15 * time.Minute
+		}
+		g.lockedUntil = now.Add(lock)
+	}
+}
+
+func (g *loginGuard) reset() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.fails = 0
+	g.lockedUntil = time.Time{}
+}
+
+// --- handlers ---
+
+func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
+	out := map[string]any{
+		"configured": s.store.IsConfigured(),
+		"authed":     s.validSession(r),
+	}
+	if !s.store.IsConfigured() {
+		out["suggestedGateway"] = guessGateway()
+		out["envApiKey"] = os.Getenv("UNIFI_API_KEY") != ""
+	}
+	writeJSON(w, 200, out)
+}
+
+// guessGateway assumes the common home layout: local /24 with the gateway
+// at .1. A UDP "dial" sends no packets — it just resolves the local address.
+func guessGateway() string {
+	conn, err := net.Dial("udp", "8.8.8.8:53")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr.IP.To4() == nil {
+		return ""
+	}
+	ip := addr.IP.To4()
+	return fmt.Sprintf("%d.%d.%d.1", ip[0], ip[1], ip[2])
+}
+
+// handleTestConnection lets the setup wizard verify gateway + key before
+// committing anything. Only available while unconfigured — afterwards,
+// gateway changes live in Settings behind the PIN.
+func (s *Server) handleTestConnection(w http.ResponseWriter, r *http.Request) {
+	if s.store.IsConfigured() {
+		fail(w, http.StatusConflict, "Bedtime is already set up.")
+		return
+	}
+	var in struct{ Host, APIKey string }
+	if err := readJSON(r, &in); err != nil || in.Host == "" {
+		fail(w, http.StatusBadRequest, "Gateway address is required.")
+		return
+	}
+	if in.APIKey == "" {
+		in.APIKey = os.Getenv("UNIFI_API_KEY")
+	}
+	fp, err := unifi.FetchCertFingerprint(r.Context(), in.Host)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	version, err := s.newAPI(in.Host, in.APIKey, fp).Version(r.Context())
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"version": version})
+}
+
+func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
+	if s.store.IsConfigured() {
+		fail(w, http.StatusConflict, "Bedtime is already set up.")
+		return
+	}
+	var in struct{ Host, APIKey, PIN string }
+	if err := readJSON(r, &in); err != nil || in.Host == "" {
+		fail(w, http.StatusBadRequest, "Gateway address is required.")
+		return
+	}
+	if in.APIKey == "" {
+		in.APIKey = os.Getenv("UNIFI_API_KEY") // key stays server-side
+	}
+	if in.APIKey == "" {
+		fail(w, http.StatusBadRequest, "An API key is required.")
+		return
+	}
+	pinHash, err := hashPIN(in.PIN)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	fp, err := unifi.FetchCertFingerprint(r.Context(), in.Host)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	api := s.newAPI(in.Host, in.APIKey, fp)
+	if _, err := api.Version(r.Context()); err != nil {
+		failErr(w, err)
+		return
+	}
+	site, err := api.FirstSite(r.Context())
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	err = s.store.Update(func(d *store.Data) error {
+		d.Gateway = store.Gateway{Host: in.Host, APIKey: in.APIKey, SiteID: site.ID, SiteName: site.InternalReference, CertFingerprint: fp}
+		d.Auth = store.Auth{PINHash: pinHash, SessionSecret: newSecret()}
+		return nil
+	})
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "Couldn't save settings: "+err.Error())
+		return
+	}
+	s.issueSession(w)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if !s.store.IsConfigured() {
+		fail(w, http.StatusConflict, "Bedtime isn't set up yet.")
+		return
+	}
+	if ok, wait := s.guard.allowed(s.now()); !ok {
+		fail(w, http.StatusTooManyRequests, fmt.Sprintf("Too many tries — wait %d seconds.", int(wait.Seconds())+1))
+		return
+	}
+	var in struct{ PIN string }
+	if err := readJSON(r, &in); err != nil {
+		fail(w, http.StatusBadRequest, "Bad request.")
+		return
+	}
+	if !checkPIN(s.store.Snapshot().Auth.PINHash, in.PIN) {
+		s.guard.fail(s.now())
+		fail(w, http.StatusUnauthorized, "Wrong PIN.")
+		return
+	}
+	s.guard.reset()
+	s.issueSession(w)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	s.clearSession(w)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+=================== FILE: internal/server/server.go ===================
+// Package server is Bedtime's HTTP layer: a JSON API consumed by the
+// embedded web UI, PIN-based sessions, and the gateway janitor.
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"net/http"
+	"time"
+
+	"bedtime/internal/store"
+	"bedtime/internal/unifi"
+)
+
+// UnifiAPI is the slice of unifi.Client the server consumes; tests inject
+// an in-memory fake.
+type UnifiAPI interface {
+	Version(ctx context.Context) (string, error)
+	FirstSite(ctx context.Context) (unifi.Site, error)
+	ListClients(ctx context.Context, siteID string) ([]unifi.NetClient, error)
+	ListTrafficRules(ctx context.Context) ([]unifi.TrafficRule, error)
+	CreateTrafficRule(ctx context.Context, r unifi.TrafficRule) (unifi.TrafficRule, error)
+	UpdateTrafficRule(ctx context.Context, r unifi.TrafficRule) error
+	DeleteTrafficRule(ctx context.Context, id string) error
+}
+
+type APIFactory func(host, apiKey, certFingerprint string) UnifiAPI
+
+type Server struct {
+	store  *store.Store
+	newAPI APIFactory
+	mux    *http.ServeMux
+	guard  *loginGuard
+	now    func() time.Time
+	// suspects holds ids the janitor saw as inconsistent on its previous
+	// pass; action is only taken on the second consecutive sighting, so an
+	// in-flight rule write can never be mistaken for an orphan.
+	suspects map[string]bool
+}
+
+func New(st *store.Store, newAPI APIFactory, static fs.FS) *Server {
+	s := &Server{store: st, newAPI: newAPI, guard: &loginGuard{}, now: time.Now, suspects: map[string]bool{}}
+	s.mux = http.NewServeMux()
+	s.routes(static)
+	return s
+}
+
+func (s *Server) Handler() http.Handler { return s.mux }
+
+// api builds a gateway client from the stored connection settings.
+func (s *Server) api() UnifiAPI {
+	g := s.store.Snapshot().Gateway
+	return s.newAPI(g.Host, g.APIKey, g.CertFingerprint)
+}
+
+func (s *Server) routes(static fs.FS) {
+	s.mux.Handle("/", http.FileServerFS(static))
+	s.mux.HandleFunc("GET /api/state", s.handleState)
+	s.mux.HandleFunc("POST /api/setup", s.handleSetup)
+	s.mux.HandleFunc("POST /api/test-connection", s.handleTestConnection)
+	s.mux.HandleFunc("POST /api/login", s.handleLogin)
+	s.mux.HandleFunc("POST /api/logout", s.handleLogout)
+	// Protected routes are registered by registerAPIRoutes in handlers.go.
+	s.registerAPIRoutes()
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
+}
+
+type errBody struct {
+	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
+}
+
+func fail(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, errBody{Error: msg})
+}
+
+// failErr maps gateway errors to friendly, UI-actionable responses.
+func failErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, unifi.ErrUnauthorized):
+		writeJSON(w, http.StatusBadGateway, errBody{Error: "The gateway rejected the API key.", Code: "unauthorized"})
+	case errors.Is(err, unifi.ErrCertChanged):
+		writeJSON(w, http.StatusBadGateway, errBody{Error: "Your gateway's security certificate changed. If you recently updated UniFi, re-trust it in Settings.", Code: "cert_changed"})
+	case errors.Is(err, unifi.ErrNotFound):
+		writeJSON(w, http.StatusBadGateway, errBody{Error: "The gateway didn't recognize that rule (it may have been removed in the UniFi app).", Code: "not_found"})
+	default:
+		writeJSON(w, http.StatusBadGateway, errBody{Error: "Can't reach your UniFi gateway right now.", Code: "unreachable"})
+	}
+}
+
+func readJSON(r *http.Request, v any) error {
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
+	return dec.Decode(v)
+}
+
+=================== FILE: cmd/bedtime/main.go ===================
+// Bedtime — family-friendly screen-time rules for UniFi gateways.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"bedtime/internal/server"
+	"bedtime/internal/store"
+	"bedtime/internal/unifi"
+	"bedtime/web"
+)
+
+// loadDotEnv applies KEY=VALUE lines from ./.env without overriding real
+// environment variables. Lets `bedtime` pick up UNIFI_API_KEY for setup.
+func loadDotEnv() {
+	raw, err := os.ReadFile(".env")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); ok && os.Getenv(strings.TrimSpace(k)) == "" {
+			os.Setenv(strings.TrimSpace(k), strings.TrimSpace(v))
+		}
+	}
+}
+
+func main() {
+	loadDotEnv()
+	defaultData := ""
+	if dir, err := os.UserConfigDir(); err == nil {
+		defaultData = filepath.Join(dir, "bedtime", "bedtime.json")
+	}
+	port := flag.Int("port", 8080, "port for the web UI")
+	data := flag.String("data", defaultData, "path to the bedtime data file")
+	flag.Parse()
+	if *data == "" {
+		log.Fatal("bedtime: could not determine a config directory; pass --data")
+	}
+
+	st, err := store.Load(*data)
+	if err != nil {
+		log.Fatal(err)
+	}
+	srv := server.New(st, func(host, apiKey, fp string) server.UnifiAPI {
+		return unifi.New(host, apiKey, fp)
+	}, web.Static())
+
+	go srv.RunJanitor(context.Background(), 5*time.Minute)
+
+	fmt.Printf("🌙 Bedtime is running — open http://localhost:%d\n", *port)
+	fmt.Printf("   data file: %s\n", *data)
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), srv.Handler()))
+}
+
+=================== FILE: internal/server/auth_test.go ===================
+package server
+
+import (
+	"encoding/json"
+	"net/http"
+	"strings"
+	"testing"
+)
+
+func postJSON(t *testing.T, c *http.Client, url, body string) *http.Response {
+	t.Helper()
+	resp, err := c.Post(url, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
+func getState(t *testing.T, c *http.Client, base string) (configured, authed bool) {
+	t.Helper()
+	resp, err := c.Get(base + "/api/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out struct{ Configured, Authed bool }
+	json.NewDecoder(resp.Body).Decode(&out)
+	return out.Configured, out.Authed
+}
+
+func TestSetupFlowConfiguresAndAuthenticates(t *testing.T) {
+	ts, _, st, _ := newTestServer(t)
+	c := client(t)
+
+	if conf, _ := getState(t, c, ts.URL); conf {
+		t.Fatal("fresh store must not be configured")
+	}
+	resp := postJSON(t, c, ts.URL+"/api/setup", `{"host":"http://fake","apiKey":"k","pin":"1234"}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("setup = %d", resp.StatusCode)
+	}
+	conf, authed := getState(t, c, ts.URL)
+	if !conf || !authed {
+		t.Errorf("after setup: configured=%v authed=%v, want true/true", conf, authed)
+	}
+	d := st.Snapshot()
+	if d.Gateway.SiteID != "site-1" || d.Auth.PINHash == "" || d.Auth.PINHash == "1234" || d.Auth.SessionSecret == "" {
+		t.Errorf("stored gateway/auth wrong: %+v", d)
+	}
+}
+
+func TestSetupRejectedWhenAlreadyConfigured(t *testing.T) {
+	ts, _, _, _ := newTestServer(t)
+	doSetup(t, ts)
+	resp := postJSON(t, client(t), ts.URL+"/api/setup", `{"host":"http://fake","apiKey":"k","pin":"9999"}`)
+	if resp.StatusCode != 409 {
+		t.Errorf("second setup = %d, want 409", resp.StatusCode)
+	}
+}
+
+func TestSetupValidatesGatewayBeforeSaving(t *testing.T) {
+	ts, fake, st, _ := newTestServer(t)
+	fake.failAll = http.ErrHandlerTimeout // any error
+	resp := postJSON(t, client(t), ts.URL+"/api/setup", `{"host":"http://fake","apiKey":"bad","pin":"1234"}`)
+	if resp.StatusCode == 200 {
+		t.Error("setup must fail when the gateway check fails")
+	}
+	if st.IsConfigured() {
+		t.Error("failed setup must not persist configuration")
+	}
+}
+
+func TestSetupRejectsBadPIN(t *testing.T) {
+	ts, _, _, _ := newTestServer(t)
+	for _, pin := range []string{"12", "1234567", "abcd", ""} {
+		resp := postJSON(t, client(t), ts.URL+"/api/setup", `{"host":"http://fake","apiKey":"k","pin":"`+pin+`"}`)
+		if resp.StatusCode != 400 {
+			t.Errorf("pin %q: setup = %d, want 400", pin, resp.StatusCode)
+		}
+	}
+}
+
+func TestLoginLogoutAndWrongPIN(t *testing.T) {
+	ts, _, _, _ := newTestServer(t)
+	doSetup(t, ts)
+
+	c := client(t) // fresh browser
+	if _, authed := getState(t, c, ts.URL); authed {
+		t.Fatal("fresh client must not be authed")
+	}
+	if resp := postJSON(t, c, ts.URL+"/api/login", `{"pin":"9999"}`); resp.StatusCode != 401 {
+		t.Errorf("wrong pin = %d, want 401", resp.StatusCode)
+	}
+	if resp := postJSON(t, c, ts.URL+"/api/login", `{"pin":"1234"}`); resp.StatusCode != 200 {
+		t.Errorf("right pin = %d, want 200", resp.StatusCode)
+	}
+	if _, authed := getState(t, c, ts.URL); !authed {
+		t.Error("must be authed after login")
+	}
+	postJSON(t, c, ts.URL+"/api/logout", `{}`)
+	if _, authed := getState(t, c, ts.URL); authed {
+		t.Error("must not be authed after logout")
+	}
+}
+
+func TestLoginBackoffAfterFiveFailures(t *testing.T) {
+	ts, _, _, _ := newTestServer(t)
+	doSetup(t, ts)
+	c := client(t)
+	for i := 0; i < 5; i++ {
+		postJSON(t, c, ts.URL+"/api/login", `{"pin":"0000"}`)
+	}
+	resp := postJSON(t, c, ts.URL+"/api/login", `{"pin":"1234"}`) // even the right pin
+	if resp.StatusCode != 429 {
+		t.Errorf("6th attempt = %d, want 429 (locked)", resp.StatusCode)
+	}
+}
+
+func TestProtectedEndpointRequiresSession(t *testing.T) {
+	ts, _, _, _ := newTestServer(t)
+	doSetup(t, ts)
+	resp, err := client(t).Get(ts.URL + "/api/status") // no cookie
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Errorf("status without session = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestStateSetupHintsAndEnvKeyFallback(t *testing.T) {
+	t.Setenv("UNIFI_API_KEY", "env-key")
+	ts, _, st, _ := newTestServer(t)
+	c := client(t)
+	var out struct {
+		Configured bool `json:"configured"`
+		EnvAPIKey  bool `json:"envApiKey"`
+	}
+	resp, _ := c.Get(ts.URL + "/api/state")
+	json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+	if !out.EnvAPIKey {
+		t.Error("state should advertise that the server holds an API key")
+	}
+	// Empty apiKey in setup → server uses the env key.
+	r2 := postJSON(t, c, ts.URL+"/api/setup", `{"host":"http://fake","apiKey":"","pin":"1234"}`)
+	if r2.StatusCode != 200 {
+		t.Fatalf("setup with env key = %d", r2.StatusCode)
+	}
+	if got := st.Snapshot().Gateway.APIKey; got != "env-key" {
+		t.Errorf("stored key = %q, want env-key", got)
+	}
+}
+
+func TestTestConnectionOnlyBeforeSetup(t *testing.T) {
+	ts, _, _, _ := newTestServer(t)
+	c := client(t)
+	var out struct {
+		Version string `json:"version"`
+	}
+	if code := doJSON(t, c, "POST", ts.URL+"/api/test-connection", `{"host":"http://fake","apiKey":"k"}`, &out); code != 200 || out.Version == "" {
+		t.Errorf("test-connection = %d, version = %q", code, out.Version)
+	}
+	doSetup(t, ts)
+	if code := doJSON(t, c, "POST", ts.URL+"/api/test-connection", `{"host":"http://fake","apiKey":"k"}`, nil); code != 409 {
+		t.Errorf("test-connection after setup = %d, want 409", code)
+	}
+}
+
+func TestForgedSessionRejected(t *testing.T) {
+	ts, _, _, _ := newTestServer(t)
+	doSetup(t, ts)
+	req, _ := http.NewRequest("GET", ts.URL+"/api/status", nil)
+	req.AddCookie(&http.Cookie{Name: "bedtime_session", Value: "9999999999.deadbeef"})
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Errorf("forged cookie = %d, want 401", resp.StatusCode)
+	}
+}
+
+=================== FILE: web/static/index.html ===================
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1e1a33">
+<title>Bedtime</title>
+<link rel="stylesheet" href="/css/app.css">
+<script defer src="/js/app.js"></script>
+<script defer src="/js/alpine.min.js"></script>
+</head>
+<body x-data="app" x-cloak>
+
+<div class="bg-ambient" aria-hidden="true"></div>
+
+<div class="shell">
+  <!-- Global error banner -->
+  <div class="banner" x-show="banner" x-text="banner" @click="banner=''"></div>
+
+  <!-- Loading -->
+  <template x-if="view==='loading'">
+    <main class="center"><div class="moon">🌙</div></main>
+  </template>
+
+  <!-- First-run setup wizard -->
+  <template x-if="view==='setup'">
+    <main class="card narrow">
+      <div class="hero"><span class="moon">🌙</span><h1>Bedtime</h1>
+        <p class="sub">Screen-time rules your whole family can live with.</p></div>
+
+      <div class="steps" aria-hidden="true">
+        <span class="step-dot" :class="{on: setup.step>=1}"></span>
+        <span class="step-track"><span class="step-fill" :class="{on: setup.step>=2}"></span></span>
+        <span class="step-dot" :class="{on: setup.step>=2}"></span>
+      </div>
+
+      <section x-show="setup.step===1">
+        <h2>Connect to your UniFi gateway</h2>
+        <label>Gateway address
+          <input type="text" x-model="setup.host" placeholder="192.168.0.1">
+        </label>
+        <template x-if="state.envApiKey">
+          <p class="hint">✓ An API key was found on the server — leave the field below empty to use it.</p>
+        </template>
+        <label>API key <span class="hint-inline">(UniFi console → Settings → Control Plane → Integrations)</span>
+          <input type="password" x-model="setup.apiKey" :placeholder="state.envApiKey ? 'Using the server’s key' : 'Paste your API key'">
+        </label>
+        <button class="primary" :disabled="!setup.host || setup.testing" @click="testConnection()">
+          <span x-show="!setup.testing">Test connection</span>
+          <span x-show="setup.testing">Connecting…</span>
+        </button>
+        <p class="good" x-show="setup.testOK">✓ Connected to your gateway</p>
+        <p class="bad" x-text="setup.testError"></p>
+        <button class="primary" x-show="setup.testOK" @click="setup.step=2">Next: choose a PIN →</button>
+      </section>
+
+      <section x-show="setup.step===2">
+        <h2>Choose a parent PIN</h2>
+        <p class="sub">Kids on your WiFi shouldn't be able to undo bedtime. 4–6 digits.</p>
+        <label>PIN <input type="password" inputmode="numeric" maxlength="6" x-model="setup.pin"></label>
+        <label>Repeat PIN <input type="password" inputmode="numeric" maxlength="6" x-model="setup.pin2"></label>
+        <p class="bad" x-show="setup.pin2 && setup.pin!==setup.pin2">PINs don't match</p>
+        <button class="primary" :disabled="!/^[0-9]{4,6}$/.test(setup.pin) || setup.pin!==setup.pin2"
+                @click="finishSetup()">Finish setup</button>
+      </section>
+    </main>
+  </template>
+
+  <!-- PIN login -->
+  <template x-if="view==='login'">
+    <main class="card narrow center">
+      <div class="hero"><span class="moon">🌙</span><h1>Bedtime</h1></div>
+      <div class="pin-dots">
+        <template x-for="i in 6"><span class="dot" :class="{filled: pin.length>=i, ghost: i>6}"></span></template>
+      </div>
+      <div class="keypad">
+        <template x-for="k in ['1','2','3','4','5','6','7','8','9','clr','0','ok']">
+          <button :class="k==='ok' ? 'key primary' : 'key'"
+                  @click="k==='clr' ? pin='' : (k==='ok' ? login() : (pin.length<6 && (pin+=k)))"
+                  x-text="k==='clr' ? '⌫' : (k==='ok' ? '✓' : k)"></button>
+        </template>
+      </div>
+      <p class="bad" x-text="loginError"></p>
+    </main>
+  </template>
+
+  <!-- Authed views are added in Tasks 9 and 10 -->
+  <template x-if="view==='home'">
+    <main class="card"><p>Home — Task 9</p></main>
+  </template>
+
+  <!-- Bottom navigation (authed only) -->
+  <nav class="tabbar" x-show="authedView()">
+    <button :class="{on: view==='home'}" @click="goHome()"><span>🏠</span>Home</button>
+    <button :class="{on: view==='profiles' || view==='profile'}" @click="goProfiles()"><span>👨‍👩‍👧</span>Family</button>
+    <button :class="{on: view==='settings'}" @click="goSettings()"><span>⚙️</span>Settings</button>
+  </nav>
+</div>
+</body>
+</html>
+
+=================== FILE: web/static/js/app.js ===================
+document.addEventListener('alpine:init', () => {
+  Alpine.data('app', () => ({
+    view: 'loading',
+    banner: '',
+    state: { configured: false, authed: false, suggestedGateway: '', envApiKey: false },
+
+    setup: { step: 1, host: '', apiKey: '', pin: '', pin2: '', testing: false, testOK: false, testError: '' },
+    pin: '',
+    loginError: '',
+
+    // Populated by Tasks 9–10:
+    status: [], profiles: [], devices: [], rules: [],
+    presets: [], categories: [], editing: null, wizard: null, settings: {},
+
+    async init() {
+      await this.refreshState();
+      this.route();
+    },
+
+    async refreshState() {
+      const r = await fetch('/api/state');
+      this.state = await r.json();
+    },
+
+    route() {
+      if (!this.state.configured) {
+        this.setup.host = this.state.suggestedGateway || '';
+        this.view = 'setup';
+      } else if (!this.state.authed) {
+        this.view = 'login';
+      } else {
+        this.goHome();
+      }
+    },
+
+    authedView() {
+      return ['home', 'profiles', 'profile', 'wizard', 'settings'].includes(this.view);
+    },
+
+    // api wraps fetch: JSON in/out, throws {message}, surfaces gateway
+    // problems in the global banner, bounces to login on session expiry.
+    async api(method, path, body) {
+      const opts = { method, headers: {} };
+      if (body !== undefined) {
+        opts.headers['Content-Type'] = 'application/json';
+        opts.body = JSON.stringify(body);
+      }
+      const r = await fetch(path, opts);
+      const data = r.status === 204 ? {} : await r.json().catch(() => ({}));
+      if (r.status === 401 && this.view !== 'login') {
+        this.state.authed = false;
+        this.view = 'login';
+        throw new Error(data.error || 'Please enter your PIN.');
+      }
+      if (!r.ok) {
+        if (data.code === 'unreachable' || data.code === 'unauthorized' || data.code === 'cert_changed') {
+          this.banner = data.error;
+        }
+        const e = new Error(data.error || 'Something went wrong.');
+        e.code = data.code;
+        throw e;
+      }
+      return data;
+    },
+
+    async testConnection() {
+      this.setup.testing = true;
+      this.setup.testOK = false;
+      this.setup.testError = '';
+      try {
+        await this.api('POST', '/api/test-connection', {
+          host: this.setup.host.trim(),
+          apiKey: this.setup.apiKey.trim(),
+        });
+        this.setup.testOK = true;
+      } catch (e) {
+        this.setup.testError = e.message;
+      } finally {
+        this.setup.testing = false;
+      }
+    },
+
+    async finishSetup() {
+      try {
+        await this.api('POST', '/api/setup', {
+          host: this.setup.host.trim(),
+          apiKey: this.setup.apiKey.trim(),
+          pin: this.setup.pin,
+        });
+        this.state.configured = true;
+        this.state.authed = true;
+        this.goHome();
+      } catch (e) {
+        this.setup.testError = e.message;
+        this.setup.step = 1; // most failures are connection/key problems
+        this.setup.testOK = false;
+      }
+    },
+
+    async login() {
+      try {
+        await this.api('POST', '/api/login', { pin: this.pin });
+        this.loginError = '';
+        this.pin = '';
+        this.state.authed = true;
+        this.goHome();
+      } catch (e) {
+        this.loginError = e.message;
+        this.pin = '';
+      }
+    },
+
+    // Stubs — implemented in Tasks 9 and 10.
+    async goHome() { this.view = 'home'; },
+    async goProfiles() { this.view = 'profiles'; },
+    async goSettings() { this.view = 'settings'; },
+  }));
+});
+
+=================== FILE: web/static/css/app.css ===================
+/* ============================================================
+   Bedtime — "a bedside lamp, not a network console."
+   The page is a darkened room (deep dusk gradient); every card
+   is the one lit thing in it — warm paper, lamp-amber glow.
+   Mobile-first. Large touch targets. Calm motion.
+   ============================================================ */
+
+:root {
+  /* Night — the room */
+  --dusk-900: #1c1830;
+  --dusk-700: #362f57;
+
+  /* Lamp light — the card */
+  --paper: #fdf6e8;
+  --paper-soft: #f5ead0;
+
+  /* Ink & voice — darkened from initial picks to clear WCAG AA (4.5:1)
+     against the paper card; verified with a contrast check. */
+  --ink: #2b2440;
+  --muted: #756a86;
+
+  /* The glow */
+  --amber: #e2993f;
+  --amber-deep: #a15f16;
+  --amber-soft: #f6e3c3;
+
+  --good: #2f7350;
+  --good-soft: #e4f2ea;
+  --bad: #b8452e;
+  --line: #ecdfc4;
+
+  --radius-lg: 26px;
+  --radius-md: 14px;
+  --radius-full: 999px;
+
+  --shadow-card:
+    0 1px 0 rgba(255, 255, 255, .6) inset,
+    0 30px 60px -28px rgba(18, 12, 36, .6),
+    0 10px 30px -12px rgba(226, 153, 63, .25);
+  --shadow-key: 0 10px 22px -10px rgba(20, 14, 40, .35);
+
+  --font-display: ui-serif, "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+  --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+
+  font-size: 17px;
+}
+
+* { box-sizing: border-box; }
+[x-cloak] { display: none !important; }
+
+html, body { margin: 0; min-height: 100vh; }
+
+body {
+  background: linear-gradient(190deg, var(--dusk-900) 0%, var(--dusk-700) 78%, #4a3f68 100%);
+  background-attachment: fixed;
+  color: var(--ink);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  position: relative;
+  overflow-x: hidden;
+}
+
+/* Ambient lamp-spill behind the card — the signature touch. */
+.bg-ambient {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(620px 420px at 50% 22%, rgba(226, 153, 63, .20), transparent 68%),
+    radial-gradient(900px 560px at 85% 95%, rgba(120, 96, 168, .22), transparent 70%),
+    radial-gradient(700px 460px at -10% 80%, rgba(226, 153, 63, .08), transparent 65%);
+}
+
+.shell {
+  position: relative;
+  z-index: 1;
+  max-width: 520px;
+  margin: 0 auto;
+  padding: 28px 16px 104px;
+  min-height: 100vh;
+}
+
+.center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 80vh;
+  text-align: center;
+}
+
+/* Moon — lamp glow rendered behind the glyph itself. */
+.moon {
+  position: relative;
+  display: inline-block;
+  font-size: 44px;
+  line-height: 1;
+  filter: drop-shadow(0 0 16px rgba(226, 153, 63, .65));
+  animation: breathe 5s ease-in-out infinite;
+}
+.center .moon { font-size: 64px; }
+.center .moon::before,
+.hero .moon::before {
+  content: "";
+  position: absolute;
+  inset: -34px;
+  z-index: -1;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(226, 153, 63, .35), transparent 70%);
+}
+
+@keyframes breathe {
+  0%, 100% { filter: drop-shadow(0 0 14px rgba(226, 153, 63, .55)); }
+  50% { filter: drop-shadow(0 0 22px rgba(226, 153, 63, .8)); }
+}
+
+.hero { text-align: center; margin-bottom: 22px; }
+.hero h1 {
+  margin: 10px 0 2px;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 32px;
+  letter-spacing: .01em;
+  color: #fff;
+  text-shadow: 0 2px 18px rgba(0, 0, 0, .25);
+}
+/* Inside a lamplit card, the wordmark reads in ink, not white. */
+.card .hero h1 { color: var(--ink); text-shadow: none; }
+
+.sub {
+  color: var(--muted);
+  margin: 4px 0 16px;
+  font-size: 15px;
+  line-height: 1.5;
+}
+.center .sub, .hero + .sub { color: rgba(255, 255, 255, .72); }
+
+.card {
+  background: var(--paper);
+  border: 1px solid rgba(255, 255, 255, .5);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  padding: 28px 24px 26px;
+  margin-top: 24px;
+}
+.narrow { max-width: 400px; margin-left: auto; margin-right: auto; }
+
+h2 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 21px;
+  margin: 4px 0 14px;
+  color: var(--ink);
+}
+
+label {
+  display: block;
+  margin: 16px 0 6px;
+  font-weight: 600;
+  font-size: 14.5px;
+  color: var(--ink);
+}
+.hint, .hint-inline { color: var(--muted); font-weight: 400; font-size: 13px; }
+.hint { background: var(--good-soft); color: #2f6b4c; border-radius: 10px; padding: 9px 12px; margin: 10px 0 2px; }
+
+input[type=text], input[type=password] {
+  width: 100%;
+  padding: 14px 15px;
+  margin-top: 7px;
+  border: 1.5px solid var(--line);
+  border-radius: var(--radius-md);
+  font-size: 17px;
+  font-family: var(--font-body);
+  background: var(--paper-soft);
+  color: var(--ink);
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+input[type=text]::placeholder, input[type=password]::placeholder { color: #b3a98f; }
+input:focus {
+  outline: none;
+  border-color: var(--amber);
+  box-shadow: 0 0 0 4px rgba(226, 153, 63, .18);
+  background: #fffdf8;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: none;
+  border-radius: var(--radius-md);
+  padding: 14px 18px;
+  background: var(--amber-soft);
+  color: var(--amber-deep);
+  font-weight: 600;
+  transition: transform .12s ease, box-shadow .12s ease, background-color .15s ease, opacity .15s ease;
+}
+button:hover:not(:disabled) { background: #f1d9a9; }
+button:active:not(:disabled) { transform: translateY(1px); }
+button:focus-visible {
+  outline: 3px solid rgba(226, 153, 63, .55);
+  outline-offset: 2px;
+}
+
+button.primary {
+  /* Dark ink on amber reads at 6.2:1 — comfortably clears AA and keeps
+     the warm glow (white-on-amber measured only 2.2:1). */
+  background: linear-gradient(180deg, #eba648, var(--amber));
+  color: var(--ink);
+  font-weight: 700;
+  width: 100%;
+  margin-top: 18px;
+  box-shadow: 0 10px 22px -10px rgba(196, 128, 33, .65);
+}
+button.primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, #f0af57, #d78a35);
+  box-shadow: 0 12px 26px -10px rgba(196, 128, 33, .75);
+}
+button:disabled { opacity: .45; cursor: default; transform: none; }
+
+.good { color: var(--good); font-weight: 600; font-size: 14.5px; margin: 10px 0 0; }
+.bad { color: var(--bad); min-height: 1.2em; font-size: 14px; margin: 10px 0 0; }
+
+.banner {
+  position: sticky;
+  top: 8px;
+  z-index: 10;
+  background: #fff3ee;
+  color: #9c3e2d;
+  border: 1px solid #f1c6b6;
+  border-left: 4px solid var(--bad);
+  padding: 13px 16px;
+  border-radius: 12px;
+  cursor: pointer;
+  margin-bottom: 12px;
+  box-shadow: 0 12px 30px -16px rgba(0, 0, 0, .5);
+  font-size: 14.5px;
+}
+
+/* Setup progress — two honest steps, nothing more. */
+.steps {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 0 0 22px;
+}
+.step-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--line);
+  flex: none;
+  transition: background-color .2s ease;
+}
+.step-dot.on { background: var(--amber); }
+.step-track {
+  width: 56px;
+  height: 3px;
+  border-radius: var(--radius-full);
+  background: var(--line);
+  overflow: hidden;
+}
+.step-fill {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: var(--amber);
+  transition: width .3s ease;
+}
+.step-fill.on { width: 100%; }
+
+/* PIN pad */
+.pin-dots { display: flex; gap: 14px; justify-content: center; margin: 22px 0 28px; }
+.dot {
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--line);
+  border: 1.5px solid rgba(43, 36, 64, .06);
+  transition: background-color .12s ease, transform .12s ease;
+}
+.dot.filled { background: var(--amber); transform: scale(1.1); }
+
+.keypad {
+  display: grid;
+  grid-template-columns: repeat(3, 74px);
+  gap: 14px;
+  justify-content: center;
+}
+.key {
+  height: 68px;
+  font-size: 22px;
+  font-family: var(--font-body);
+  border-radius: 50%;
+  background: var(--paper);
+  color: var(--ink);
+  box-shadow: var(--shadow-key);
+  font-weight: 500;
+}
+.key:hover:not(:disabled) { background: #fffdf8; }
+.key.primary {
+  background: linear-gradient(180deg, #eba648, var(--amber));
+  color: var(--ink);
+  box-shadow: 0 12px 24px -10px rgba(196, 128, 33, .7);
+}
+
+/* Bottom tab bar */
+.tabbar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 5;
+  display: flex;
+  justify-content: space-around;
+  background: rgba(253, 246, 232, .92);
+  backdrop-filter: blur(10px);
+  border-top: 1px solid var(--line);
+  padding: 9px max(12px, env(safe-area-inset-left)) max(10px, env(safe-area-inset-bottom));
+}
+.tabbar button {
+  background: none;
+  box-shadow: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 6px 18px;
+  border-radius: var(--radius-md);
+}
+.tabbar button span { font-size: 22px; }
+.tabbar button.on { color: var(--amber-deep); }
+
+@media (min-width: 640px) {
+  .shell { padding-top: 56px; }
+  .card { padding: 34px 32px 30px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .moon { animation: none; }
+  * { transition-duration: .001ms !important; animation-duration: .001ms !important; }
+}

@@ -1,0 +1,1793 @@
+# Enrollment feature review package
+
+=================== FILE: internal/server/enroll_handlers.go ===================
+package server
+
+import (
+	"net"
+	"net/http"
+	"strings"
+
+	"familytime/internal/store"
+	"familytime/internal/unifi"
+)
+
+// requesterIP extracts the caller's IP from an http.Request's RemoteAddr,
+// stripping the port. Falls back to the raw value if it isn't a host:port
+// pair, so a malformed address can't be silently treated as "no IP" (it
+// just won't match any live client, which is the safe failure mode).
+func requesterIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
+}
+
+// findClientByIP returns the live gateway client whose IP matches ip. This
+// is the only way enroll identifies a device — a client-supplied MAC is
+// never trusted, since the entire point of enrollment is working around
+// clients that can't (or won't, via Private Wi-Fi Address) report their
+// real MAC honestly.
+func findClientByIP(clients []unifi.NetClient, ip string) (unifi.NetClient, bool) {
+	if ip == "" {
+		return unifi.NetClient{}, false
+	}
+	for _, c := range clients {
+		if c.IPAddress == ip {
+			return c, true
+		}
+	}
+	return unifi.NetClient{}, false
+}
+
+type enrollGroup struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Emoji string `json:"emoji"`
+	Color string `json:"color"`
+}
+
+// enrollGroups lists the family's real groups for the enroll picker — never
+// the virtual Everyone profile, which isn't a valid enrollment target.
+func enrollGroups(d store.Data) []enrollGroup {
+	out := make([]enrollGroup, 0, len(d.Profiles))
+	for _, p := range d.Profiles {
+		out = append(out, enrollGroup{ID: p.ID, Name: p.Name, Emoji: p.Emoji, Color: p.Color})
+	}
+	return out
+}
+
+// handleEnrollWhoami identifies the calling device by matching its
+// requesting IP against the gateway's live client list. Public — no
+// session required — because it can only ever describe the device making
+// the request, never anyone else's.
+func (s *Server) handleEnrollWhoami(w http.ResponseWriter, r *http.Request) {
+	if !s.store.IsConfigured() {
+		fail(w, http.StatusConflict, "Family Time isn't set up yet.")
+		return
+	}
+	d := s.store.Snapshot()
+	groups := enrollGroups(d)
+
+	live, err := s.api().ListClients(r.Context(), d.Gateway.SiteID)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	client, ok := findClientByIP(live, requesterIP(r.RemoteAddr))
+	if !ok {
+		writeJSON(w, 200, map[string]any{"found": false, "groups": groups})
+		return
+	}
+	mac := strings.ToLower(client.MACAddress)
+	profileID, deviceName := "", ""
+	for _, p := range d.Profiles {
+		for _, dev := range p.Devices {
+			if dev.MAC == mac {
+				profileID, deviceName = p.ID, dev.Name
+			}
+		}
+	}
+	writeJSON(w, 200, map[string]any{
+		"found":             true,
+		"mac":               mac,
+		"name":              client.Name,
+		"ip":                client.IPAddress,
+		"currentProfileId":  profileID,
+		"currentDeviceName": deviceName,
+		"groups":            groups,
+	})
+}
+
+// handleEnroll assigns the calling device — identified the same IP-to-
+// client way as whoami — to a group. The request body's name is trusted
+// (it's just a label), but never a MAC: the server re-resolves it fresh
+// from RemoteAddr, exactly like whoami, so nothing the client claims about
+// its own identity is ever trusted.
+//
+// Gateway-first, same as profile editing: every affected profile's rules
+// (the device's old group, if it's moving, and its new one) are re-targeted
+// on the gateway before the store is updated. A mid-loop failure still
+// persists the new intent (via persistPartialEnroll) rather than leaving
+// the UI showing a stale assignment while the gateway has already started
+// enforcing the new one — see retargetProfileRules for the full rationale.
+func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
+	if !s.store.IsConfigured() {
+		fail(w, http.StatusConflict, "Family Time isn't set up yet.")
+		return
+	}
+	var in struct{ Name, ProfileID string }
+	if err := readJSON(r, &in); err != nil {
+		fail(w, 400, "Bad request.")
+		return
+	}
+	d := s.store.Snapshot()
+
+	var target store.Profile
+	found := false
+	for _, p := range d.Profiles {
+		if p.ID == in.ProfileID {
+			target, found = p, true
+			break
+		}
+	}
+	if !found {
+		// Note: the virtual Everyone profile is never in d.Profiles, so
+		// this also naturally rejects profileId="everyone".
+		fail(w, 400, "Pick a valid group.")
+		return
+	}
+
+	live, err := s.api().ListClients(r.Context(), d.Gateway.SiteID)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	client, ok := findClientByIP(live, requesterIP(r.RemoteAddr))
+	if !ok {
+		fail(w, http.StatusNotFound, "Couldn't spot this device on your network. Make sure you're on the home Wi-Fi (not cellular or a VPN) and try again.")
+		return
+	}
+	mac := strings.ToLower(client.MACAddress)
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		name = client.Name
+	}
+	if name == "" {
+		name = mac
+	}
+
+	// Find the profile (other than the target) that currently owns this
+	// MAC, if any — a device already assigned somewhere else is moving,
+	// not just being newly assigned.
+	var source *store.Profile
+	for i := range d.Profiles {
+		if d.Profiles[i].ID == target.ID {
+			continue
+		}
+		for _, dev := range d.Profiles[i].Devices {
+			if dev.MAC == mac {
+				p := d.Profiles[i]
+				source = &p
+				break
+			}
+		}
+		if source != nil {
+			break
+		}
+	}
+
+	updates := map[string]store.Profile{}
+	// steps holds, in gateway-first processing order (source before
+	// target), each profile that needs its rules re-targeted alongside the
+	// rules it owns — computed once up front so the zero-devices-with-
+	// rules guard below and the retarget loop after it see the same data.
+	type step struct {
+		profile store.Profile
+		rules   []store.FamilyRule
+	}
+	rulesFor := func(profileID string) []store.FamilyRule {
+		var out []store.FamilyRule
+		for _, fr := range d.Rules {
+			if fr.ProfileID == profileID {
+				out = append(out, fr)
+			}
+		}
+		return out
+	}
+	var steps []step
+	if source != nil {
+		s2 := *source
+		devs := make([]store.Device, 0, len(s2.Devices))
+		for _, dev := range s2.Devices {
+			if dev.MAC != mac {
+				devs = append(devs, dev)
+			}
+		}
+		s2.Devices = devs
+		updates[s2.ID] = s2
+		steps = append(steps, step{s2, rulesFor(s2.ID)})
+	}
+	replaced := false
+	devs := make([]store.Device, 0, len(target.Devices)+1)
+	for _, dev := range target.Devices {
+		if dev.MAC == mac {
+			devs = append(devs, store.Device{MAC: mac, Name: name})
+			replaced = true
+		} else {
+			devs = append(devs, dev)
+		}
+	}
+	if !replaced {
+		devs = append(devs, store.Device{MAC: mac, Name: name})
+	}
+	target.Devices = devs
+	updates[target.ID] = target
+	steps = append(steps, step{target, rulesFor(target.ID)})
+
+	// Same guard as handleProfileUpdate: never leave a profile with rules
+	// but zero devices (which would make those rules untranslatable). This
+	// only matters for the source profile — the target always gains a
+	// device here — but checking both keeps the two code paths identical.
+	for _, st := range steps {
+		if len(st.profile.Devices) == 0 && len(st.rules) > 0 {
+			fail(w, 400, "This profile still has rules — keep at least one device, or delete the rules first.")
+			return
+		}
+	}
+
+	recreated := map[string][]string{}
+	for _, st := range steps {
+		got, rerr := s.retargetProfileRules(r.Context(), st.profile, st.rules)
+		for k, v := range got {
+			recreated[k] = v
+		}
+		if rerr != nil {
+			s.persistPartialEnroll(updates, recreated)
+			respondRetargetError(w, rerr)
+			return
+		}
+	}
+
+	if err := s.persistProfilesAndRuleIDs(updates, recreated); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "groupName": target.Name, "deviceName": name})
+}
+
+=================== FILE: internal/server/enroll_test.go ===================
+package server
+
+import (
+	"strings"
+	"testing"
+
+	"familytime/internal/store"
+	"familytime/internal/unifi"
+)
+
+// httptest requests always arrive with RemoteAddr "127.0.0.1:<port>", so
+// every enroll test identifies "this device" by giving a fake client
+// IPAddress of "127.0.0.1".
+const enrollTestIP = "127.0.0.1"
+
+func TestEnrollWhoamiFound(t *testing.T) {
+	ts, fake, st, _ := newTestServer(t)
+	doSetup(t, ts) // configures the store; enroll itself needs no session
+	seedProfile(t, st)
+	fake.clients = []unifi.NetClient{
+		{Name: "iPhone 72:68", MACAddress: "AA:BB:CC:DD:EE:99", IPAddress: enrollTestIP, Type: "WIRELESS"},
+	}
+
+	c := client(t) // fresh, unauthenticated client
+	var out struct {
+		Found             bool
+		MAC               string
+		Name              string
+		IP                string
+		CurrentProfileID  string `json:"currentProfileId"`
+		CurrentDeviceName string `json:"currentDeviceName"`
+		Groups            []struct{ ID, Name, Emoji, Color string }
+	}
+	if code := getJSON(t, c, ts.URL+"/api/enroll/whoami", &out); code != 200 {
+		t.Fatalf("whoami = %d", code)
+	}
+	if !out.Found || out.MAC != "aa:bb:cc:dd:ee:99" || out.Name != "iPhone 72:68" || out.IP != enrollTestIP {
+		t.Fatalf("unexpected whoami response: %+v", out)
+	}
+	if out.CurrentProfileID != "" || out.CurrentDeviceName != "" {
+		t.Errorf("device isn't assigned yet, want empty current fields: %+v", out)
+	}
+	if len(out.Groups) != 1 || out.Groups[0].ID != "p1" || out.Groups[0].Name != "Emma" {
+		t.Errorf("groups = %+v, want the seeded profile", out.Groups)
+	}
+}
+
+func TestEnrollWhoamiFoundAlreadyAssigned(t *testing.T) {
+	ts, fake, st, _ := newTestServer(t)
+	doSetup(t, ts)
+	seedProfile(t, st) // p1, device aa:aa:aa:aa:aa:01 named "iPad"
+	fake.clients = []unifi.NetClient{
+		{Name: "iPhone 72:68", MACAddress: "aa:aa:aa:aa:aa:01", IPAddress: enrollTestIP, Type: "WIRELESS"},
+	}
+
+	c := client(t)
+	var out struct {
+		Found             bool
+		CurrentProfileID  string `json:"currentProfileId"`
+		CurrentDeviceName string `json:"currentDeviceName"`
+	}
+	if code := getJSON(t, c, ts.URL+"/api/enroll/whoami", &out); code != 200 {
+		t.Fatalf("whoami = %d", code)
+	}
+	if !out.Found || out.CurrentProfileID != "p1" || out.CurrentDeviceName != "iPad" {
+		t.Errorf("expected the existing assignment to be reported: %+v", out)
+	}
+}
+
+func TestEnrollWhoamiNotFound(t *testing.T) {
+	ts, _, st, _ := newTestServer(t)
+	doSetup(t, ts)
+	seedProfile(t, st)
+	// No fake clients at all — the requester's IP won't match anything.
+
+	c := client(t)
+	var out struct {
+		Found  bool
+		Groups []struct{ ID string }
+	}
+	code := getJSON(t, c, ts.URL+"/api/enroll/whoami", &out)
+	if code != 200 {
+		t.Fatalf("whoami not-found = %d, want 200", code)
+	}
+	if out.Found {
+		t.Error("expected found=false")
+	}
+	if len(out.Groups) != 1 {
+		t.Errorf("groups should still be returned when not found: %+v", out.Groups)
+	}
+}
+
+func TestEnrollWhoamiUnconfigured(t *testing.T) {
+	ts, _, _, _ := newTestServer(t)
+	c := client(t)
+	var out errBody
+	code := getJSON(t, c, ts.URL+"/api/enroll/whoami", &out)
+	if code != 409 {
+		t.Fatalf("whoami unconfigured = %d, want 409", code)
+	}
+	if out.Error == "" {
+		t.Error("expected a friendly message")
+	}
+}
+
+func TestEnrollAssignsToProfile(t *testing.T) {
+	ts, fake, st, _ := newTestServer(t)
+	doSetup(t, ts)
+	seedProfile(t, st) // p1
+	fake.clients = []unifi.NetClient{
+		{Name: "iPhone 72:68", MACAddress: "AA:BB:CC:DD:EE:99", IPAddress: enrollTestIP, Type: "WIRELESS"},
+	}
+
+	c := client(t) // unauthenticated — enrollment needs no session
+	var out struct {
+		OK         bool `json:"ok"`
+		GroupName  string
+		DeviceName string
+	}
+	code := doJSON(t, c, "POST", ts.URL+"/api/enroll", `{"name":"Ava's iPhone","profileId":"p1"}`, &out)
+	if code != 200 {
+		t.Fatalf("enroll = %d", code)
+	}
+	if !out.OK || out.GroupName != "Emma" || out.DeviceName != "Ava's iPhone" {
+		t.Errorf("unexpected enroll response: %+v", out)
+	}
+	profs := st.Snapshot().Profiles
+	if len(profs) != 1 || len(profs[0].Devices) != 2 {
+		t.Fatalf("store profiles = %+v", profs)
+	}
+	var got store.Device
+	for _, dev := range profs[0].Devices {
+		if dev.MAC == "aa:bb:cc:dd:ee:99" {
+			got = dev
+		}
+	}
+	if got.Name != "Ava's iPhone" {
+		t.Errorf("device not persisted with the given name: %+v", got)
+	}
+}
+
+func TestEnrollDefaultsNameToGatewayName(t *testing.T) {
+	ts, fake, st, _ := newTestServer(t)
+	doSetup(t, ts)
+	seedProfile(t, st)
+	fake.clients = []unifi.NetClient{
+		{Name: "iPhone 72:68", MACAddress: "AA:BB:CC:DD:EE:99", IPAddress: enrollTestIP, Type: "WIRELESS"},
+	}
+
+	c := client(t)
+	var out struct{ DeviceName string }
+	code := doJSON(t, c, "POST", ts.URL+"/api/enroll", `{"name":"","profileId":"p1"}`, &out)
+	if code != 200 {
+		t.Fatalf("enroll = %d", code)
+	}
+	if out.DeviceName != "iPhone 72:68" {
+		t.Errorf("deviceName = %q, want the gateway's name", out.DeviceName)
+	}
+}
+
+func TestEnrollMovesBetweenProfilesRetargetsBoth(t *testing.T) {
+	ts, fake, st, _ := newTestServer(t)
+	c := doSetup(t, ts) // authed client, needed for the rule-creation calls below
+	err := st.Update(func(d *store.Data) error {
+		d.Profiles = []store.Profile{
+			{ID: "src", Name: "Old Group", Devices: []store.Device{
+				{MAC: "aa:bb:cc:dd:ee:99", Name: "iPhone"},
+				{MAC: "aa:bb:cc:dd:ee:01", Name: "Other device"}, // keeps src non-empty after the move
+			}},
+			{ID: "dst", Name: "New Group", Devices: []store.Device{
+				{MAC: "aa:bb:cc:dd:ee:02", Name: "Existing device"},
+			}},
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var srcRule, dstRule store.FamilyRule
+	if code := doJSON(t, c, "POST", ts.URL+"/api/rules",
+		`{"profileId":"src","name":"No YouTube","what":{"type":"preset","presetId":"youtube"},"when":{"kind":"always"}}`, &srcRule); code != 200 {
+		t.Fatalf("create src rule = %d", code)
+	}
+	if code := doJSON(t, c, "POST", ts.URL+"/api/rules",
+		`{"profileId":"dst","name":"No TikTok","what":{"type":"preset","presetId":"tiktok"},"when":{"kind":"always"}}`, &dstRule); code != 200 {
+		t.Fatalf("create dst rule = %d", code)
+	}
+
+	fake.clients = []unifi.NetClient{
+		{Name: "iPhone 72:68", MACAddress: "AA:BB:CC:DD:EE:99", IPAddress: enrollTestIP, Type: "WIRELESS"},
+	}
+
+	anon := client(t) // enrollment itself needs no session
+	var out struct {
+		OK        bool `json:"ok"`
+		GroupName string
+	}
+	code := doJSON(t, anon, "POST", ts.URL+"/api/enroll", `{"name":"Ava's iPhone","profileId":"dst"}`, &out)
+	if code != 200 {
+		t.Fatalf("enroll = %d", code)
+	}
+	if out.GroupName != "New Group" {
+		t.Errorf("groupName = %q", out.GroupName)
+	}
+
+	profs := st.Snapshot().Profiles
+	var src, dst store.Profile
+	for _, p := range profs {
+		if p.ID == "src" {
+			src = p
+		}
+		if p.ID == "dst" {
+			dst = p
+		}
+	}
+	for _, dev := range src.Devices {
+		if dev.MAC == "aa:bb:cc:dd:ee:99" {
+			t.Errorf("device still present in source profile: %+v", src.Devices)
+		}
+	}
+	foundInDst := false
+	for _, dev := range dst.Devices {
+		if dev.MAC == "aa:bb:cc:dd:ee:99" {
+			foundInDst = true
+		}
+	}
+	if !foundInDst {
+		t.Errorf("device not added to destination profile: %+v", dst.Devices)
+	}
+
+	gwSrc, ok := fake.ruleByDesc(srcRule.ID)
+	if !ok {
+		t.Fatal("source gateway rule missing")
+	}
+	for _, td := range gwSrc.TargetDevices {
+		if td.ClientMAC == "aa:bb:cc:dd:ee:99" {
+			t.Errorf("source gateway rule still targets the moved device: %+v", gwSrc.TargetDevices)
+		}
+	}
+	gwDst, ok := fake.ruleByDesc(dstRule.ID)
+	if !ok {
+		t.Fatal("destination gateway rule missing")
+	}
+	gotInDst := false
+	for _, td := range gwDst.TargetDevices {
+		if td.ClientMAC == "aa:bb:cc:dd:ee:99" {
+			gotInDst = true
+		}
+	}
+	if !gotInDst {
+		t.Errorf("destination gateway rule doesn't target the moved device: %+v", gwDst.TargetDevices)
+	}
+}
+
+func TestEnrollUnknownProfileID400(t *testing.T) {
+	ts, fake, st, _ := newTestServer(t)
+	doSetup(t, ts)
+	seedProfile(t, st)
+	fake.clients = []unifi.NetClient{
+		{Name: "iPhone 72:68", MACAddress: "AA:BB:CC:DD:EE:99", IPAddress: enrollTestIP},
+	}
+	c := client(t)
+	code := doJSON(t, c, "POST", ts.URL+"/api/enroll", `{"name":"x","profileId":"nope"}`, nil)
+	if code != 400 {
+		t.Errorf("unknown profileId = %d, want 400", code)
+	}
+}
+
+func TestEnrollRejectsEveryone(t *testing.T) {
+	ts, fake, st, _ := newTestServer(t)
+	doSetup(t, ts)
+	seedProfile(t, st)
+	fake.clients = []unifi.NetClient{
+		{Name: "iPhone 72:68", MACAddress: "AA:BB:CC:DD:EE:99", IPAddress: enrollTestIP},
+	}
+	c := client(t)
+	code := doJSON(t, c, "POST", ts.URL+"/api/enroll", `{"name":"x","profileId":"everyone"}`, nil)
+	if code != 400 {
+		t.Errorf("profileId=everyone = %d, want 400", code)
+	}
+}
+
+func TestEnrollDeviceNotOnNetwork404(t *testing.T) {
+	ts, _, st, _ := newTestServer(t)
+	doSetup(t, ts)
+	seedProfile(t, st)
+	// No fake client matches the requester's IP.
+	c := client(t)
+	var out errBody
+	code := doJSON(t, c, "POST", ts.URL+"/api/enroll", `{"name":"x","profileId":"p1"}`, &out)
+	if code != 404 {
+		t.Fatalf("device not found = %d, want 404", code)
+	}
+	if out.Error == "" {
+		t.Error("expected a friendly message")
+	}
+}
+
+func TestEnrollUnconfigured(t *testing.T) {
+	ts, _, _, _ := newTestServer(t)
+	c := client(t)
+	code := doJSON(t, c, "POST", ts.URL+"/api/enroll", `{"name":"x","profileId":"p1"}`, nil)
+	if code != 409 {
+		t.Errorf("enroll unconfigured = %d, want 409", code)
+	}
+}
+
+// TestEnrollGatewayFailurePersistsIntent mirrors
+// TestProfileUpdatePersistsIntentOnPartialGatewayFailure: moving a device
+// between two profiles that both have rules, with the destination's
+// gateway update failing partway through the retarget loop. The store must
+// still end up holding the new intent (device moved) even though the
+// gateway only partially converged — see persistPartialEnroll.
+func TestEnrollGatewayFailurePersistsIntent(t *testing.T) {
+	ts, fake, st, _ := newTestServer(t)
+	c := doSetup(t, ts)
+	err := st.Update(func(d *store.Data) error {
+		d.Profiles = []store.Profile{
+			{ID: "src", Name: "Old Group", Devices: []store.Device{
+				{MAC: "aa:bb:cc:dd:ee:99", Name: "iPhone"},
+				{MAC: "aa:bb:cc:dd:ee:01", Name: "Other device"}, // keeps src non-empty after the move
+			}},
+			{ID: "dst", Name: "New Group", Devices: []store.Device{{MAC: "aa:bb:cc:dd:ee:02", Name: "Existing"}}},
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var srcRule, dstRule store.FamilyRule
+	doJSON(t, c, "POST", ts.URL+"/api/rules",
+		`{"profileId":"src","name":"No YouTube","what":{"type":"preset","presetId":"youtube"},"when":{"kind":"always"}}`, &srcRule)
+	doJSON(t, c, "POST", ts.URL+"/api/rules",
+		`{"profileId":"dst","name":"No TikTok","what":{"type":"preset","presetId":"tiktok"},"when":{"kind":"always"}}`, &dstRule)
+	gwDst, ok := fake.ruleByDesc(dstRule.ID)
+	if !ok {
+		t.Fatal("dst gateway rule missing")
+	}
+
+	fake.clients = []unifi.NetClient{
+		{Name: "iPhone", MACAddress: "AA:BB:CC:DD:EE:99", IPAddress: enrollTestIP},
+	}
+	fake.mu.Lock()
+	fake.failUpdateID = gwDst.ID // dst is processed second (source-first order)
+	fake.mu.Unlock()
+
+	anon := client(t)
+	var errOut errBody
+	code := doJSON(t, anon, "POST", ts.URL+"/api/enroll", `{"name":"Ava's iPhone","profileId":"dst"}`, &errOut)
+	if code < 500 || code >= 600 {
+		t.Fatalf("partial gateway failure = %d, want 5xx; body=%+v", code, errOut)
+	}
+	if errOut.Error == "" {
+		t.Error("expected a friendly error message")
+	}
+
+	profs := st.Snapshot().Profiles
+	var src, dst store.Profile
+	for _, p := range profs {
+		if p.ID == "src" {
+			src = p
+		}
+		if p.ID == "dst" {
+			dst = p
+		}
+	}
+	if len(src.Devices) != 1 || src.Devices[0].MAC != "aa:bb:cc:dd:ee:01" {
+		t.Errorf("source profile should have lost the moved device despite the gateway failure: %+v", src.Devices)
+	}
+	foundInDst := false
+	for _, dev := range dst.Devices {
+		if dev.MAC == "aa:bb:cc:dd:ee:99" {
+			foundInDst = true
+		}
+	}
+	if !foundInDst {
+		t.Errorf("destination profile should already hold the new intent: %+v", dst.Devices)
+	}
+
+	// The source's rule (processed first) converged; the destination's
+	// (processed second, and failing) did not.
+	gwSrc, _ := fake.ruleByDesc(srcRule.ID)
+	if len(gwSrc.TargetDevices) != 1 {
+		t.Errorf("source gateway rule should have been retargeted to the one remaining device: %+v", gwSrc.TargetDevices)
+	}
+	gwDstAfter, _ := fake.ruleByDesc(dstRule.ID)
+	if len(gwDstAfter.TargetDevices) != 1 {
+		t.Errorf("destination gateway rule should be unchanged (update failed): %+v", gwDstAfter.TargetDevices)
+	}
+
+	// Clearing the failure and re-saving the destination profile (the
+	// existing profile-update path) converges the rest, exactly like the
+	// profile-edit partial-failure test.
+	fake.mu.Lock()
+	fake.failUpdateID = ""
+	fake.mu.Unlock()
+	code = doJSON(t, c, "PUT", ts.URL+"/api/profiles/dst",
+		`{"name":"New Group","devices":[{"mac":"aa:bb:cc:dd:ee:02","name":"Existing"},{"mac":"aa:bb:cc:dd:ee:99","name":"Ava's iPhone"}]}`, nil)
+	if code != 200 {
+		t.Fatalf("retry profile update = %d, want 200", code)
+	}
+	gwDstFinal, _ := fake.ruleByDesc(dstRule.ID)
+	if len(gwDstFinal.TargetDevices) != 2 {
+		t.Errorf("destination gateway rule after retry = %+v, want 2 (converged)", gwDstFinal.TargetDevices)
+	}
+}
+
+func TestSettingsIncludesEnrollURL(t *testing.T) {
+	ts, _, _, srv := newTestServer(t)
+	c := doSetup(t, ts)
+	srv.SetAdvertisedPort(9191)
+
+	var out struct{ EnrollUrl string }
+	if code := getJSON(t, c, ts.URL+"/api/settings", &out); code != 200 {
+		t.Fatalf("settings = %d", code)
+	}
+	if !strings.HasPrefix(out.EnrollUrl, "http://") || !strings.HasSuffix(out.EnrollUrl, ":9191/enroll") {
+		t.Errorf("enrollUrl = %q, want http://<lan-ip>:9191/enroll", out.EnrollUrl)
+	}
+}
+
+=================== FILE: internal/server/server.go ===================
+// Package server is Family Time's HTTP layer: a JSON API consumed by the
+// embedded web UI, PIN-based sessions, and the gateway janitor.
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"log"
+	"net/http"
+	"time"
+
+	"familytime/internal/store"
+	"familytime/internal/unifi"
+)
+
+// UnifiAPI is the slice of unifi.Client the server consumes; tests inject
+// an in-memory fake.
+type UnifiAPI interface {
+	Version(ctx context.Context) (string, error)
+	FirstSite(ctx context.Context) (unifi.Site, error)
+	ListClients(ctx context.Context, siteID string) ([]unifi.NetClient, error)
+	ListTrafficRules(ctx context.Context) ([]unifi.TrafficRule, error)
+	CreateTrafficRule(ctx context.Context, r unifi.TrafficRule) (unifi.TrafficRule, error)
+	UpdateTrafficRule(ctx context.Context, r unifi.TrafficRule) error
+	DeleteTrafficRule(ctx context.Context, id string) error
+}
+
+type APIFactory func(host, apiKey, certFingerprint string) UnifiAPI
+
+type Server struct {
+	store  *store.Store
+	newAPI APIFactory
+	mux    *http.ServeMux
+	guard  *loginGuard
+	now    func() time.Time
+	// detectGateway guesses the local gateway address; overridable in tests.
+	// The env-var API key fallback only applies when the requested host
+	// matches this, so a stray/foreign host can never silently borrow the
+	// server's key.
+	detectGateway func() string
+	// suspects holds ids the janitor saw as inconsistent on its previous
+	// pass; action is only taken on the second consecutive sighting, so an
+	// in-flight rule write can never be mistaken for an orphan.
+	suspects map[string]bool
+	// advertisedPort is the port shown in the enroll URL on the Settings
+	// screen. The LAN IP is auto-detected (see localIP), but the listening
+	// port isn't observable from inside net/http, so main wires it in via
+	// SetAdvertisedPort. Defaults to 8080, matching main's --port default.
+	advertisedPort int
+}
+
+func New(st *store.Store, newAPI APIFactory, static fs.FS) *Server {
+	s := &Server{store: st, newAPI: newAPI, guard: &loginGuard{}, now: time.Now, detectGateway: guessGateway, suspects: map[string]bool{}, advertisedPort: 8080}
+	s.mux = http.NewServeMux()
+	s.routes(static)
+	return s
+}
+
+func (s *Server) Handler() http.Handler { return s.mux }
+
+// SetAdvertisedPort sets the port used to build the enroll URL shown in
+// Settings (see handleSettingsGet). Callers that don't care about a custom
+// port (e.g. most tests) never need to call this.
+func (s *Server) SetAdvertisedPort(port int) {
+	s.advertisedPort = port
+}
+
+// api builds a gateway client from the stored connection settings.
+func (s *Server) api() UnifiAPI {
+	g := s.store.Snapshot().Gateway
+	return s.newAPI(g.Host, g.APIKey, g.CertFingerprint)
+}
+
+func (s *Server) routes(static fs.FS) {
+	s.mux.Handle("/", http.FileServerFS(static))
+	// The enroll page is visited directly by a device's own browser (a QR
+	// code or typed address), not through the SPA's client-side router, so
+	// it needs its own server-side route to the same embedded index.html.
+	s.mux.HandleFunc("GET /enroll", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFileFS(w, r, static, "index.html")
+	})
+	s.mux.HandleFunc("GET /api/state", s.handleState)
+	s.mux.HandleFunc("POST /api/setup", s.handleSetup)
+	s.mux.HandleFunc("POST /api/test-connection", s.handleTestConnection)
+	s.mux.HandleFunc("POST /api/login", s.handleLogin)
+	s.mux.HandleFunc("POST /api/logout", s.handleLogout)
+	// Enrollment is intentionally unauthenticated: the server resolves the
+	// device's identity itself from the request's source IP against the
+	// gateway's live client list, so a visitor can only ever affect the
+	// device making the request — there's no client-supplied identity to
+	// abuse. See handleEnrollWhoami / handleEnroll.
+	s.mux.HandleFunc("GET /api/enroll/whoami", s.handleEnrollWhoami)
+	s.mux.HandleFunc("POST /api/enroll", s.handleEnroll)
+	// Protected routes are registered by registerAPIRoutes in handlers.go.
+	s.registerAPIRoutes()
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
+}
+
+type errBody struct {
+	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
+}
+
+func fail(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, errBody{Error: msg})
+}
+
+// failErr maps gateway errors to friendly, UI-actionable responses.
+func failErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, unifi.ErrUnauthorized):
+		writeJSON(w, http.StatusBadGateway, errBody{Error: "The gateway rejected the API key.", Code: "unauthorized"})
+	case errors.Is(err, unifi.ErrCertChanged):
+		writeJSON(w, http.StatusBadGateway, errBody{Error: "Your gateway's security certificate changed. If you recently updated UniFi, re-trust it in Settings.", Code: "cert_changed"})
+	case errors.Is(err, unifi.ErrNotFound):
+		writeJSON(w, http.StatusBadGateway, errBody{Error: "The gateway didn't recognize that rule (it may have been removed in the UniFi app).", Code: "not_found"})
+	default:
+		log.Printf("familytime: gateway error: %v", err)
+		writeJSON(w, http.StatusBadGateway, errBody{Error: "Can't reach your UniFi gateway right now.", Code: "unreachable"})
+	}
+}
+
+func readJSON(r *http.Request, v any) error {
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
+	return dec.Decode(v)
+}
+
+=================== FILE: internal/server/handlers.go ===================
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"sort"
+	"strings"
+
+	"familytime/internal/rules"
+	"familytime/internal/store"
+	"familytime/internal/unifi"
+)
+
+// registerAPIRoutes wires the protected JSON API (auth-gated).
+func (s *Server) registerAPIRoutes() {
+	s.mux.Handle("GET /api/presets", s.auth(s.handlePresets))
+	s.mux.Handle("GET /api/devices", s.auth(s.handleDevices))
+	s.mux.Handle("GET /api/profiles", s.auth(s.handleProfilesList))
+	s.mux.Handle("POST /api/profiles", s.auth(s.handleProfileCreate))
+	s.mux.Handle("PUT /api/profiles/{id}", s.auth(s.handleProfileUpdate))
+	s.mux.Handle("DELETE /api/profiles/{id}", s.auth(s.handleProfileDelete))
+	s.mux.Handle("GET /api/rules", s.auth(s.handleRulesList))
+	s.mux.Handle("POST /api/rules", s.auth(s.handleRuleCreate))
+	s.mux.Handle("PUT /api/rules/{id}", s.auth(s.handleRuleUpdate))
+	s.mux.Handle("DELETE /api/rules/{id}", s.auth(s.handleRuleDelete))
+	s.mux.Handle("POST /api/pause", s.auth(s.handlePause))
+	s.mux.Handle("DELETE /api/pause/{profileId}", s.auth(s.handleUnpause))
+	s.mux.Handle("GET /api/status", s.auth(s.handleStatus))
+	s.mux.Handle("GET /api/settings", s.auth(s.handleSettingsGet))
+	s.mux.Handle("PUT /api/settings/pin", s.auth(s.handleSettingsPIN))
+	s.mux.Handle("PUT /api/settings/gateway", s.auth(s.handleSettingsGateway))
+	s.mux.Handle("POST /api/settings/trust-cert", s.auth(s.handleTrustCert))
+}
+
+func (s *Server) handlePresets(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{
+		"presets":    rules.Presets(),
+		"categories": rules.Categories(),
+	})
+}
+
+// profileForID resolves a profile id, including the virtual Everyone
+// profile (which is never stored).
+func profileForID(d store.Data, id string) (store.Profile, bool) {
+	if id == store.EveryoneProfileID {
+		return store.Profile{ID: store.EveryoneProfileID, Name: "Everyone", Emoji: "🌍"}, true
+	}
+	for _, p := range d.Profiles {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return store.Profile{}, false
+}
+
+type deviceInfo struct {
+	MAC       string `json:"mac"`
+	Name      string `json:"name"`
+	IP        string `json:"ip,omitempty"`
+	Connected bool   `json:"connected"`
+	Wireless  bool   `json:"wireless"`
+	ProfileID string `json:"profileId,omitempty"`
+}
+
+func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
+	d := s.store.Snapshot()
+	live, err := s.api().ListClients(r.Context(), d.Gateway.SiteID)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	assigned := map[string]string{}     // mac → profile id
+	assignedName := map[string]string{} // mac → snapshot name
+	for _, p := range d.Profiles {
+		for _, dev := range p.Devices {
+			assigned[dev.MAC] = p.ID
+			assignedName[dev.MAC] = dev.Name
+		}
+	}
+	seen := map[string]bool{}
+	var out []deviceInfo
+	for _, c := range live {
+		mac := strings.ToLower(c.MACAddress)
+		seen[mac] = true
+		name := c.Name
+		if name == "" {
+			name = mac
+		}
+		out = append(out, deviceInfo{
+			MAC: mac, Name: name, IP: c.IPAddress,
+			Connected: true, Wireless: c.Type == "WIRELESS",
+			ProfileID: assigned[mac],
+		})
+	}
+	for mac, pid := range assigned {
+		if !seen[mac] {
+			out = append(out, deviceInfo{MAC: mac, Name: assignedName[mac], Connected: false, ProfileID: pid})
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].MAC < out[j].MAC
+	})
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) handleProfilesList(w http.ResponseWriter, r *http.Request) {
+	d := s.store.Snapshot()
+	if d.Profiles == nil {
+		d.Profiles = []store.Profile{}
+	}
+	writeJSON(w, 200, d.Profiles)
+}
+
+type profileInput struct {
+	Name    string         `json:"name"`
+	Emoji   string         `json:"emoji"`
+	Color   string         `json:"color"`
+	Devices []store.Device `json:"devices"`
+}
+
+// validateProfileInput normalizes MACs and rejects devices already assigned
+// to a different profile (selfID exempts the profile being edited).
+func validateProfileInput(d store.Data, in *profileInput, selfID string) error {
+	in.Name = strings.TrimSpace(in.Name)
+	if in.Name == "" {
+		return fmt.Errorf("give this profile a name")
+	}
+	seen := map[string]bool{}
+	for i := range in.Devices {
+		in.Devices[i].MAC = strings.ToLower(strings.TrimSpace(in.Devices[i].MAC))
+		mac := in.Devices[i].MAC
+		if mac == "" {
+			return fmt.Errorf("device with empty MAC")
+		}
+		if seen[mac] {
+			return fmt.Errorf("device %s listed twice", mac)
+		}
+		seen[mac] = true
+		for _, p := range d.Profiles {
+			if p.ID == selfID {
+				continue
+			}
+			for _, dev := range p.Devices {
+				if dev.MAC == mac {
+					return fmt.Errorf("that device already belongs to %s", p.Name)
+				}
+			}
+		}
+	}
+	if in.Devices == nil {
+		in.Devices = []store.Device{}
+	}
+	return nil
+}
+
+func (s *Server) handleProfileCreate(w http.ResponseWriter, r *http.Request) {
+	var in profileInput
+	if err := readJSON(r, &in); err != nil {
+		fail(w, 400, "Bad request.")
+		return
+	}
+	p := store.Profile{ID: store.NewID()}
+	err := s.store.Update(func(d *store.Data) error {
+		if err := validateProfileInput(*d, &in, p.ID); err != nil {
+			return err
+		}
+		p.Name, p.Emoji, p.Color, p.Devices = in.Name, in.Emoji, in.Color, in.Devices
+		d.Profiles = append(d.Profiles, p)
+		return nil
+	})
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, 200, p)
+}
+
+// persistProfilesAndRuleIDs writes new name/emoji/color/devices for one or
+// more profiles (keyed by id) together with any rule ids recreated on the
+// gateway so far, in a single store update. Enrollment can touch two
+// profiles at once (a device's old group and its new one); profile editing
+// only ever touches one, via persistProfileAndRuleIDs below.
+func (s *Server) persistProfilesAndRuleIDs(updates map[string]store.Profile, recreated map[string][]string) error {
+	return s.store.Update(func(d *store.Data) error {
+		for i := range d.Profiles {
+			if updated, ok := updates[d.Profiles[i].ID]; ok {
+				d.Profiles[i] = updated
+			}
+		}
+		for i := range d.Rules {
+			if ids, ok := recreated[d.Rules[i].ID]; ok {
+				d.Rules[i].UnifiRuleIDs = ids
+			}
+		}
+		return nil
+	})
+}
+
+// persistProfileAndRuleIDs writes the profile's new name/emoji/color/devices
+// together with any rule ids recreated on the gateway so far, in a single
+// store update.
+func (s *Server) persistProfileAndRuleIDs(id string, updated store.Profile, recreated map[string][]string) error {
+	return s.persistProfilesAndRuleIDs(map[string]store.Profile{id: updated}, recreated)
+}
+
+// persistPartialProfileUpdate persists the profile's new intent (and any
+// rule ids recreated so far) when the gateway-first loop in
+// handleProfileUpdate stops partway through. Without this, a mid-loop
+// failure would leave rules 1..N-1 already enforcing the new devices on the
+// gateway while the store/UI kept showing the old ones — a silent,
+// permanent divergence the janitor can't detect (it only reconciles rule-id
+// existence, never target-device content). Persisting the intent here means
+// a later re-save, or any edit to one of this profile's rules, re-translates
+// from the stored profile and converges the rest of the rules (gateway PUTs
+// are idempotent, so retrying is safe).
+func (s *Server) persistPartialProfileUpdate(id string, updated store.Profile, recreated map[string][]string) {
+	if err := s.persistProfileAndRuleIDs(id, updated, recreated); err != nil {
+		log.Printf("familytime: failed to persist profile intent after partial gateway failure: %v", err)
+	}
+}
+
+// persistPartialEnroll is persistPartialProfileUpdate's multi-profile
+// counterpart, for enrollment moves that can touch two profiles (the
+// device's old group and its new one) in a single request. Same rationale:
+// persist the new intent even when the gateway-first retarget loop stops
+// partway through, rather than leave the store silently stale.
+func (s *Server) persistPartialEnroll(updates map[string]store.Profile, recreated map[string][]string) {
+	if err := s.persistProfilesAndRuleIDs(updates, recreated); err != nil {
+		log.Printf("familytime: failed to persist enroll intent after partial gateway failure: %v", err)
+	}
+}
+
+// failPartialProfileUpdate reports a gateway error that stopped
+// handleProfileUpdate's retarget loop partway through, after the caller has
+// already persisted the new intent via persistPartialProfileUpdate. It keeps
+// failErr's status/code mapping (so the UI's existing gateway-error handling
+// still applies) but swaps in a message that tells the parent their change
+// was saved and a re-save will finish syncing the gateway.
+func failPartialProfileUpdate(w http.ResponseWriter, err error) {
+	code := "unreachable"
+	switch {
+	case errors.Is(err, unifi.ErrUnauthorized):
+		code = "unauthorized"
+	case errors.Is(err, unifi.ErrCertChanged):
+		code = "cert_changed"
+	case errors.Is(err, unifi.ErrNotFound):
+		code = "not_found"
+	default:
+		log.Printf("familytime: gateway error: %v", err)
+	}
+	writeJSON(w, http.StatusBadGateway, errBody{
+		Error: "Saved your changes, but some of this profile's rules couldn't be updated on the gateway — check your connection and save this profile again.",
+		Code:  code,
+	})
+}
+
+// retargetTranslateError marks a rules.Translate failure encountered inside
+// retargetProfileRules, so callers can tell a validation problem (e.g. a
+// profile that would end up with zero devices while it still has rules)
+// apart from a real gateway failure. Reported as a plain 400 with the
+// original message — see respondRetargetError.
+type retargetTranslateError struct{ err error }
+
+func (e *retargetTranslateError) Error() string { return e.err.Error() }
+func (e *retargetTranslateError) Unwrap() error { return e.err }
+
+// retargetProfileRules re-targets every one of profileRules' gateway rules
+// to match updated's devices, gateway-first: each rule is updated in place,
+// or recreated if its gateway rule vanished behind our back (e.g. deleted
+// in the UniFi app), before the next one is attempted. It returns the ids
+// of any rules it had to recreate (family rule id -> new gateway rule
+// ids) — reflecting everything it got done before stopping, even when it
+// returns an error, so callers can persist that partial progress (see
+// persistPartialProfileUpdate / persistPartialEnroll) instead of silently
+// discarding gateway state that already changed.
+//
+// Shared by profile editing (handleProfileUpdate) and device enrollment
+// (handleEnroll), which can retarget up to two profiles — the device's old
+// group and its new one — in a single request.
+func (s *Server) retargetProfileRules(ctx context.Context, updated store.Profile, profileRules []store.FamilyRule) (map[string][]string, error) {
+	recreated := map[string][]string{}
+	for _, fr := range profileRules {
+		tr, err := rules.Translate(fr, updated)
+		if err != nil {
+			return recreated, &retargetTranslateError{err}
+		}
+		if len(fr.UnifiRuleIDs) == 1 {
+			tr.ID = fr.UnifiRuleIDs[0]
+			err = s.api().UpdateTrafficRule(ctx, tr)
+		} else {
+			err = unifi.ErrNotFound
+		}
+		if errors.Is(err, unifi.ErrNotFound) {
+			// Defensive: clear any stale gateway ids so the recreate can't
+			// leave untracked rules enforcing (deleteGatewayRules tolerates
+			// not-found).
+			if derr := s.deleteGatewayRules(ctx, fr.UnifiRuleIDs); derr != nil {
+				return recreated, derr
+			}
+			tr.ID = ""
+			created, cerr := s.api().CreateTrafficRule(ctx, tr)
+			if cerr != nil {
+				return recreated, cerr
+			}
+			recreated[fr.ID] = []string{created.ID}
+			err = nil
+		}
+		if err != nil {
+			return recreated, err
+		}
+	}
+	return recreated, nil
+}
+
+// respondRetargetError reports a retargetProfileRules failure. Callers must
+// persist the affected profile(s)' new intent (via
+// persistPartialProfileUpdate or persistPartialEnroll) before calling this
+// — see retargetProfileRules. Translate/validation failures are reported as
+// a plain 400 with the original message; gateway failures get
+// failPartialProfileUpdate's friendly "saved, but sync failed" message.
+func respondRetargetError(w http.ResponseWriter, err error) {
+	var terr *retargetTranslateError
+	if errors.As(err, &terr) {
+		fail(w, 400, terr.Error())
+		return
+	}
+	failPartialProfileUpdate(w, err)
+}
+
+func (s *Server) handleProfileUpdate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == store.EveryoneProfileID {
+		fail(w, 400, "The Everyone profile can't be edited.")
+		return
+	}
+	var in profileInput
+	if err := readJSON(r, &in); err != nil {
+		fail(w, 400, "Bad request.")
+		return
+	}
+	d := s.store.Snapshot()
+	var existing *store.Profile
+	for i := range d.Profiles {
+		if d.Profiles[i].ID == id {
+			existing = &d.Profiles[i]
+			break
+		}
+	}
+	if existing == nil {
+		fail(w, 404, "No such profile.")
+		return
+	}
+	if err := validateProfileInput(d, &in, id); err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	updated := *existing
+	updated.Name, updated.Emoji, updated.Color, updated.Devices = in.Name, in.Emoji, in.Color, in.Devices
+
+	var profileRules []store.FamilyRule
+	for _, fr := range d.Rules {
+		if fr.ProfileID == id {
+			profileRules = append(profileRules, fr)
+		}
+	}
+	if len(updated.Devices) == 0 && len(profileRules) > 0 {
+		fail(w, 400, "This profile still has rules — keep at least one device, or delete the rules first.")
+		return
+	}
+
+	// Gateway first: re-target every one of this profile's rules before
+	// reporting success, so a fully successful request never claims a
+	// gateway state that isn't real. If the loop stops partway through,
+	// each failure path persists the profile's new intent (and any ids
+	// recreated so far) anyway — see persistPartialProfileUpdate — because
+	// the alternative (silently keeping the old devices in the store while
+	// rules 1..N-1 already enforce the new ones on the gateway) is a worse,
+	// permanent divergence that nothing else can detect or repair.
+	recreated, err := s.retargetProfileRules(r.Context(), updated, profileRules)
+	if err != nil {
+		s.persistPartialProfileUpdate(id, updated, recreated)
+		respondRetargetError(w, err)
+		return
+	}
+
+	if err := s.persistProfileAndRuleIDs(id, updated, recreated); err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, updated)
+}
+
+// deleteGatewayRules removes gateway rules by id, tolerating rules that
+// were already deleted behind our back.
+func (s *Server) deleteGatewayRules(ctx context.Context, ids []string) error {
+	api := s.api()
+	for _, id := range ids {
+		if err := api.DeleteTrafficRule(ctx, id); err != nil && !errors.Is(err, unifi.ErrNotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) handleProfileDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == store.EveryoneProfileID {
+		fail(w, 400, "The Everyone profile can't be deleted.")
+		return
+	}
+	d := s.store.Snapshot()
+	if _, ok := profileForID(d, id); !ok {
+		fail(w, 404, "No such profile.")
+		return
+	}
+	// Gateway first: remove this profile's rules so nothing keeps enforcing.
+	var gatewayIDs []string
+	for _, fr := range d.Rules {
+		if fr.ProfileID == id {
+			gatewayIDs = append(gatewayIDs, fr.UnifiRuleIDs...)
+		}
+	}
+	if err := s.deleteGatewayRules(r.Context(), gatewayIDs); err != nil {
+		failErr(w, err)
+		return
+	}
+	err := s.store.Update(func(d *store.Data) error {
+		kept := d.Rules[:0]
+		for _, fr := range d.Rules {
+			if fr.ProfileID != id {
+				kept = append(kept, fr)
+			}
+		}
+		d.Rules = kept
+		for i := range d.Profiles {
+			if d.Profiles[i].ID == id {
+				d.Profiles = append(d.Profiles[:i], d.Profiles[i+1:]...)
+				break
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+=================== FILE: internal/server/settings_handlers.go ===================
+package server
+
+import (
+	"fmt"
+	"net/http"
+
+	"familytime/internal/store"
+	"familytime/internal/unifi"
+)
+
+func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
+	g := s.store.Snapshot().Gateway
+	enrollURL := ""
+	if ip := localIP(); ip != "" {
+		enrollURL = fmt.Sprintf("http://%s:%d/enroll", ip, s.advertisedPort)
+	}
+	writeJSON(w, 200, map[string]string{
+		"host":      g.Host,
+		"siteName":  g.SiteName,
+		"dataPath":  s.store.Path(),
+		"enrollUrl": enrollURL,
+	})
+}
+
+func (s *Server) handleSettingsPIN(w http.ResponseWriter, r *http.Request) {
+	var in struct{ CurrentPin, NewPin string }
+	if err := readJSON(r, &in); err != nil {
+		fail(w, 400, "Bad request.")
+		return
+	}
+	if !checkPIN(s.store.Snapshot().Auth.PINHash, in.CurrentPin) {
+		fail(w, 401, "Current PIN is wrong.")
+		return
+	}
+	h, err := hashPIN(in.NewPin)
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	// Rotating the session secret invalidates every existing session cookie
+	// — including this caller's — so a fresh one is issued below to keep the
+	// parent who just changed the PIN logged in.
+	err = s.store.Update(func(d *store.Data) error {
+		d.Auth.PINHash = h
+		d.Auth.SessionSecret = newSecret()
+		return nil
+	})
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	s.guard.reset()
+	s.issueSession(w)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+// validateAndStoreGateway checks connectivity with the given credentials and
+// persists them. Shared by gateway update and trust-cert.
+func (s *Server) validateAndStoreGateway(w http.ResponseWriter, r *http.Request, host, apiKey string) {
+	fp, err := unifi.FetchCertFingerprint(r.Context(), host)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	api := s.newAPI(host, apiKey, fp)
+	if _, err := api.Version(r.Context()); err != nil {
+		failErr(w, err)
+		return
+	}
+	site, err := api.FirstSite(r.Context())
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	err = s.store.Update(func(d *store.Data) error {
+		d.Gateway = store.Gateway{Host: host, APIKey: apiKey, SiteID: site.ID, SiteName: site.InternalReference, CertFingerprint: fp}
+		return nil
+	})
+	if err != nil {
+		fail(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleSettingsGateway(w http.ResponseWriter, r *http.Request) {
+	var in struct{ Host, APIKey string }
+	if err := readJSON(r, &in); err != nil || in.Host == "" || in.APIKey == "" {
+		fail(w, 400, "Gateway address and API key are required.")
+		return
+	}
+	s.validateAndStoreGateway(w, r, in.Host, in.APIKey)
+}
+
+// handleTrustCert re-pins the gateway certificate after a legitimate change
+// (e.g. a firmware update regenerated it).
+func (s *Server) handleTrustCert(w http.ResponseWriter, r *http.Request) {
+	g := s.store.Snapshot().Gateway
+	s.validateAndStoreGateway(w, r, g.Host, g.APIKey)
+}
+
+=================== FILE: internal/server/auth.go ===================
+package server
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/crypto/bcrypt"
+
+	"familytime/internal/store"
+	"familytime/internal/unifi"
+)
+
+const (
+	sessionCookie = "familytime_session"
+	sessionTTL    = 30 * 24 * time.Hour
+)
+
+var pinRe = regexp.MustCompile(`^[0-9]{4,6}$`)
+
+func hashPIN(pin string) (string, error) {
+	if !pinRe.MatchString(pin) {
+		return "", fmt.Errorf("PIN must be 4–6 digits")
+	}
+	h, err := bcrypt.GenerateFromPassword([]byte(pin), bcrypt.DefaultCost)
+	return string(h), err
+}
+
+func checkPIN(hash, pin string) bool {
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(pin)) == nil
+}
+
+func newSecret() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func sign(secret string, expiry int64) string {
+	m := hmac.New(sha256.New, []byte(secret))
+	fmt.Fprintf(m, "%d", expiry)
+	return hex.EncodeToString(m.Sum(nil))
+}
+
+func (s *Server) issueSession(w http.ResponseWriter) {
+	secret := s.store.Snapshot().Auth.SessionSecret
+	exp := s.now().Add(sessionTTL).Unix()
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    fmt.Sprintf("%d.%s", exp, sign(secret, exp)),
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(sessionTTL.Seconds()),
+	})
+}
+
+func (s *Server) clearSession(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1})
+}
+
+func (s *Server) validSession(r *http.Request) bool {
+	c, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return false
+	}
+	expStr, sig, ok := strings.Cut(c.Value, ".")
+	if !ok {
+		return false
+	}
+	exp, err := strconv.ParseInt(expStr, 10, 64)
+	if err != nil || s.now().Unix() > exp {
+		return false
+	}
+	secret := s.store.Snapshot().Auth.SessionSecret
+	if secret == "" {
+		return false
+	}
+	return hmac.Equal([]byte(sig), []byte(sign(secret, exp)))
+}
+
+// auth wraps protected handlers with session validation.
+func (s *Server) auth(h http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.validSession(r) {
+			fail(w, http.StatusUnauthorized, "Please enter your PIN.")
+			return
+		}
+		h(w, r)
+	})
+}
+
+// loginGuard rate-limits PIN attempts: after 5 consecutive failures the
+// login locks, doubling from 30s up to 15min.
+type loginGuard struct {
+	mu          sync.Mutex
+	fails       int
+	lockedUntil time.Time
+}
+
+func (g *loginGuard) allowed(now time.Time) (bool, time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if now.Before(g.lockedUntil) {
+		return false, time.Until(g.lockedUntil)
+	}
+	return true, 0
+}
+
+func (g *loginGuard) fail(now time.Time) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.fails++
+	if g.fails >= 5 {
+		lock := 30 * time.Second << uint(min(g.fails-5, 5)) // 30s → 16m cap
+		if lock > 15*time.Minute {
+			lock = 15 * time.Minute
+		}
+		g.lockedUntil = now.Add(lock)
+	}
+}
+
+func (g *loginGuard) reset() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.fails = 0
+	g.lockedUntil = time.Time{}
+}
+
+// --- handlers ---
+
+func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
+	out := map[string]any{
+		"configured": s.store.IsConfigured(),
+		"authed":     s.validSession(r),
+	}
+	if !s.store.IsConfigured() {
+		gw := s.detectGateway()
+		out["suggestedGateway"] = gw
+		out["envApiKey"] = os.Getenv("UNIFI_API_KEY") != "" && gw != ""
+	}
+	writeJSON(w, 200, out)
+}
+
+// localIP returns this machine's LAN IPv4 address using a UDP "dial" — no
+// packets are actually sent, it just asks the OS which local address it
+// would route through to reach the internet. Shared by guessGateway
+// (assumes the gateway sits at .1 on that /24) and Settings' enrollUrl (the
+// address a phone on the same LAN can actually reach this server at).
+func localIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:53")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr.IP.To4() == nil {
+		return ""
+	}
+	return addr.IP.To4().String()
+}
+
+// guessGateway assumes the common home layout: local /24 with the gateway
+// at .1.
+func guessGateway() string {
+	ip := localIP()
+	if ip == "" {
+		return ""
+	}
+	i := strings.LastIndexByte(ip, '.')
+	if i < 0 {
+		return ""
+	}
+	return ip[:i+1] + "1"
+}
+
+// normalizeHost strips a URL scheme and surrounding whitespace so hosts can
+// be compared regardless of how they were typed ("192.168.0.1" vs
+// "https://192.168.0.1/").
+func normalizeHost(h string) string {
+	h = strings.TrimSpace(h)
+	if i := strings.Index(h, "://"); i >= 0 {
+		h = h[i+3:]
+	}
+	return strings.TrimSuffix(h, "/")
+}
+
+// envKeyAllowedFor reports whether the server-side UNIFI_API_KEY may be used
+// for the given requested host: only when it equals the auto-detected
+// gateway, so a request naming some other host can never silently borrow
+// the server's key.
+func (s *Server) envKeyAllowedFor(host string) bool {
+	gw := s.detectGateway()
+	return gw != "" && normalizeHost(host) == normalizeHost(gw)
+}
+
+// handleTestConnection lets the setup wizard verify gateway + key before
+// committing anything. Only available while unconfigured — afterwards,
+// gateway changes live in Settings behind the PIN.
+func (s *Server) handleTestConnection(w http.ResponseWriter, r *http.Request) {
+	if s.store.IsConfigured() {
+		fail(w, http.StatusConflict, "Family Time is already set up.")
+		return
+	}
+	var in struct{ Host, APIKey string }
+	if err := readJSON(r, &in); err != nil || in.Host == "" {
+		fail(w, http.StatusBadRequest, "Gateway address is required.")
+		return
+	}
+	if in.APIKey == "" && s.envKeyAllowedFor(in.Host) {
+		in.APIKey = os.Getenv("UNIFI_API_KEY")
+	}
+	fp, err := unifi.FetchCertFingerprint(r.Context(), in.Host)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	version, err := s.newAPI(in.Host, in.APIKey, fp).Version(r.Context())
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"version": version})
+}
+
+func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
+	if s.store.IsConfigured() {
+		fail(w, http.StatusConflict, "Family Time is already set up.")
+		return
+	}
+	var in struct{ Host, APIKey, PIN string }
+	if err := readJSON(r, &in); err != nil || in.Host == "" {
+		fail(w, http.StatusBadRequest, "Gateway address is required.")
+		return
+	}
+	if in.APIKey == "" && s.envKeyAllowedFor(in.Host) {
+		in.APIKey = os.Getenv("UNIFI_API_KEY") // key stays server-side
+	}
+	if in.APIKey == "" {
+		fail(w, http.StatusBadRequest, "An API key is required.")
+		return
+	}
+	pinHash, err := hashPIN(in.PIN)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	fp, err := unifi.FetchCertFingerprint(r.Context(), in.Host)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	api := s.newAPI(in.Host, in.APIKey, fp)
+	if _, err := api.Version(r.Context()); err != nil {
+		failErr(w, err)
+		return
+	}
+	site, err := api.FirstSite(r.Context())
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	err = s.store.Update(func(d *store.Data) error {
+		d.Gateway = store.Gateway{Host: in.Host, APIKey: in.APIKey, SiteID: site.ID, SiteName: site.InternalReference, CertFingerprint: fp}
+		d.Auth = store.Auth{PINHash: pinHash, SessionSecret: newSecret()}
+		return nil
+	})
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "Couldn't save settings: "+err.Error())
+		return
+	}
+	s.issueSession(w)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if !s.store.IsConfigured() {
+		fail(w, http.StatusConflict, "Family Time isn't set up yet.")
+		return
+	}
+	if ok, wait := s.guard.allowed(s.now()); !ok {
+		fail(w, http.StatusTooManyRequests, fmt.Sprintf("Too many tries — wait %d seconds.", int(wait.Seconds())+1))
+		return
+	}
+	var in struct{ PIN string }
+	if err := readJSON(r, &in); err != nil {
+		fail(w, http.StatusBadRequest, "Bad request.")
+		return
+	}
+	if !checkPIN(s.store.Snapshot().Auth.PINHash, in.PIN) {
+		s.guard.fail(s.now())
+		fail(w, http.StatusUnauthorized, "Wrong PIN.")
+		return
+	}
+	s.guard.reset()
+	s.issueSession(w)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	s.clearSession(w)
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+
+=================== FILE: cmd/familytime/main.go ===================
+// Family Time — family-friendly screen-time rules for UniFi gateways.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"familytime/internal/server"
+	"familytime/internal/store"
+	"familytime/internal/unifi"
+	"familytime/web"
+)
+
+// loadDotEnv applies KEY=VALUE lines from ./.env without overriding real
+// environment variables. Lets `familytime` pick up UNIFI_API_KEY for setup.
+func loadDotEnv() {
+	raw, err := os.ReadFile(".env")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); ok && os.Getenv(strings.TrimSpace(k)) == "" {
+			os.Setenv(strings.TrimSpace(k), unquoteEnvValue(strings.TrimSpace(v)))
+		}
+	}
+}
+
+// unquoteEnvValue strips one layer of matching single or double quotes, so
+// both KEY=value and KEY="value" / KEY='value' .env styles work.
+func unquoteEnvValue(v string) string {
+	if len(v) >= 2 {
+		first, last := v[0], v[len(v)-1]
+		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+			return v[1 : len(v)-1]
+		}
+	}
+	return v
+}
+
+func main() {
+	loadDotEnv()
+	defaultData := ""
+	if dir, err := os.UserConfigDir(); err == nil {
+		defaultData = filepath.Join(dir, "familytime", "familytime.json")
+	}
+	port := flag.Int("port", 8080, "port for the web UI")
+	data := flag.String("data", defaultData, "path to the familytime data file")
+	flag.Parse()
+	if *data == "" {
+		log.Fatal("familytime: could not determine a config directory; pass --data")
+	}
+
+	st, err := store.Load(*data)
+	if err != nil {
+		log.Fatal(err)
+	}
+	srv := server.New(st, func(host, apiKey, fp string) server.UnifiAPI {
+		return unifi.New(host, apiKey, fp)
+	}, web.Static())
+	srv.SetAdvertisedPort(*port)
+
+	go srv.RunJanitor(context.Background(), 5*time.Minute)
+
+	fmt.Printf("🛡️  Family Time is running — open http://localhost:%d\n", *port)
+	fmt.Printf("   data file: %s\n", *data)
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), srv.Handler()))
+}
+
+=================== README excerpt (Enrolling devices) ===================
+## Enrolling devices
+
+iPhones and iPads use a "Private Wi-Fi Address" by default: your UniFi
+gateway sees a randomized MAC and a generic name like "iPhone 72:68" instead
+of the device's real hardware address, so it never shows up reliably in the
+device picker.
+
+Family Time works around this with a self-enrollment page. Settings shows an
+address (e.g. `http://192.168.0.42:8080/enroll`) — open it in the browser
+**on the device you want to add**. The server identifies the device by the
+IP address of that very connection against the gateway's live client list
+(never anything the browser claims about itself), then lets you name it and
+pick its group right there. No PIN needed — the page can only ever affect
+the device that opened it.
+
+**Caveat:** iOS's *"Rotate Wi-Fi Address"* setting (the non-default,
+Rotating option under a Wi-Fi network's Private Address setting) changes the
+private MAC address periodically, which will make an enrolled device look
+new again and require re-enrolling. For a set-it-and-forget-it setup, use
+the default *"Fixed"* private address on kids' devices for your home
+network — or turn Private Address off for that network entirely.
+
+## Security notes

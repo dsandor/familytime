@@ -1,0 +1,27 @@
+# Secrets / local config
+.env
+.env.*
+
+# Built binaries
+/familytime
+bootstrap
+*.exe
+
+# Go build/test artifacts
+*.test
+*.out
+coverage.*
+
+# Local data store
+familytime.json
+
+# AWS SAM build output
+.aws-sam/
+
+# macOS
+.DS_Store
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp

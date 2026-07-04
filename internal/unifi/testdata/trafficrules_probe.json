@@ -1,0 +1,153 @@
+[
+  {
+    "_id": "6a47312e47ab4d670819716c",
+    "action": "BLOCK",
+    "app_category_ids": [],
+    "app_ids": [],
+    "bandwidth_limit": {
+      "download_limit_kbps": 1024,
+      "enabled": false,
+      "upload_limit_kbps": 1024
+    },
+    "description": "[family-time-probe] weekly",
+    "domains": [
+      {
+        "domain": "example.com",
+        "port_ranges": [],
+        "ports": []
+      }
+    ],
+    "enabled": false,
+    "ip_addresses": [],
+    "ip_ranges": [],
+    "matching_target": "DOMAIN",
+    "network_ids": [],
+    "regions": [],
+    "schedule": {
+      "mode": "EVERY_WEEK",
+      "repeat_on_days": [
+        "mon",
+        "tue"
+      ],
+      "time_all_day": false,
+      "time_range_end": "23:00",
+      "time_range_start": "20:00"
+    },
+    "target_devices": [
+      {
+        "client_mac": "de:ad:be:ef:00:01",
+        "type": "CLIENT"
+      }
+    ],
+    "traffic_direction": "TO"
+  },
+  {
+    "_id": "6a47313e47ab4d6708197190",
+    "action": "BLOCK",
+    "app_category_ids": [],
+    "app_ids": [],
+    "bandwidth_limit": {
+      "download_limit_kbps": 1024,
+      "enabled": false,
+      "upload_limit_kbps": 1024
+    },
+    "description": "[family-time-probe] midnight",
+    "domains": [
+      {
+        "domain": "example.com",
+        "port_ranges": [],
+        "ports": []
+      }
+    ],
+    "enabled": false,
+    "ip_addresses": [],
+    "ip_ranges": [],
+    "matching_target": "DOMAIN",
+    "network_ids": [],
+    "regions": [],
+    "schedule": {
+      "mode": "EVERY_DAY",
+      "repeat_on_days": [],
+      "time_all_day": false,
+      "time_range_end": "07:00",
+      "time_range_start": "21:00"
+    },
+    "target_devices": [
+      {
+        "client_mac": "de:ad:be:ef:00:01",
+        "type": "CLIENT"
+      }
+    ],
+    "traffic_direction": "TO"
+  },
+  {
+    "_id": "6a47313e47ab4d6708197193",
+    "action": "BLOCK",
+    "app_category_ids": [],
+    "app_ids": [],
+    "bandwidth_limit": {
+      "download_limit_kbps": 1024,
+      "enabled": false,
+      "upload_limit_kbps": 1024
+    },
+    "description": "[family-time-probe] everyone",
+    "domains": [
+      {
+        "domain": "example.com",
+        "port_ranges": [],
+        "ports": []
+      }
+    ],
+    "enabled": false,
+    "ip_addresses": [],
+    "ip_ranges": [],
+    "matching_target": "DOMAIN",
+    "network_ids": [],
+    "regions": [],
+    "schedule": {
+      "mode": "ALWAYS",
+      "repeat_on_days": [],
+      "time_all_day": false
+    },
+    "target_devices": [
+      {
+        "type": "ALL_CLIENTS"
+      }
+    ],
+    "traffic_direction": "TO"
+  },
+  {
+    "_id": "6a47315b47ab4d67081971f1",
+    "action": "BLOCK",
+    "app_category_ids": [],
+    "app_ids": [],
+    "bandwidth_limit": {
+      "download_limit_kbps": 1024,
+      "enabled": false,
+      "upload_limit_kbps": 1024
+    },
+    "description": "[family-time-probe] onetime2",
+    "domains": [],
+    "enabled": false,
+    "ip_addresses": [],
+    "ip_ranges": [],
+    "matching_target": "INTERNET",
+    "network_ids": [],
+    "regions": [],
+    "schedule": {
+      "date": "2026-07-03",
+      "mode": "ONE_TIME_ONLY",
+      "repeat_on_days": [],
+      "time_all_day": false,
+      "time_range_end": "10:30",
+      "time_range_start": "10:00"
+    },
+    "target_devices": [
+      {
+        "client_mac": "de:ad:be:ef:00:01",
+        "type": "CLIENT"
+      }
+    ],
+    "traffic_direction": "TO"
+  }
+]
