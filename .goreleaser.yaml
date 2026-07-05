@@ -7,7 +7,8 @@ before:
     - go mod tidy
 
 builds:
-  - main: ./cmd/familytime
+  - id: familytime
+    main: ./cmd/familytime
     binary: familytime
     env:
       - CGO_ENABLED=0
@@ -18,6 +19,22 @@ builds:
         goarch: arm64
     ldflags:
       - -s -w
+
+# Sign + notarize the darwin binaries (quill — runs on the Linux runner).
+# Gated on the secrets being set so releases still work before they exist.
+notarize:
+  macos:
+    - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
+      ids: [familytime]
+      sign:
+        certificate: "{{ .Env.MACOS_SIGN_P12 }}"
+        password: "{{ .Env.MACOS_SIGN_PASSWORD }}"
+      notarize:
+        issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
+        key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
+        key: "{{ .Env.MACOS_NOTARY_KEY }}"
+        wait: true
+        timeout: 30m
 
 archives:
   - name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
