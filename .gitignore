@@ -2,6 +2,12 @@
 .env
 .env.*
 
+# AI dev artifacts — local only
+CLAUDE.md
+.claude/
+.superpowers/
+docs/superpowers/
+
 # Built binaries
 /familytime
 bootstrap

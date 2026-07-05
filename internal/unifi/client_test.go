@@ -207,7 +207,7 @@ func TestRenameClientSuccess(t *testing.T) {
 				t.Errorf("GET path = %s", r.URL.Path)
 			}
 			fmt.Fprint(w, `{"meta":{"rc":"ok"},"data":[
-				{"_id":"u1","mac":"00:05:cd:3a:00:e9"},
+				{"_id":"u1","mac":"a1:b2:c3:3a:00:e9"},
 				{"_id":"u2","mac":"aa:bb:cc:dd:ee:99","name":"old name"}
 			]}`)
 		case http.MethodPut:
@@ -235,7 +235,7 @@ func TestRenameClientSuccess(t *testing.T) {
 
 func TestRenameClientMACNotFound(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"meta":{"rc":"ok"},"data":[{"_id":"u1","mac":"00:05:cd:3a:00:e9"}]}`)
+		fmt.Fprint(w, `{"meta":{"rc":"ok"},"data":[{"_id":"u1","mac":"a1:b2:c3:3a:00:e9"}]}`)
 	}))
 	defer ts.Close()
 
